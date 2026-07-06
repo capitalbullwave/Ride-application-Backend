@@ -1,0 +1,69 @@
+# Core
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+python-dotenv==1.0.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+psycopg2-binary==2.9.10
+
+# Auth & Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+slowapi==0.1.9
+
+# Validation
+pydantic==2.10.4
+pydantic-settings==2.7.0
+email-validator==2.2.0
+
+# Redis & Celery
+redis==5.2.1
+celery==5.4.0
+flower==2.0.1
+
+# Scheduler
+apscheduler==3.10.4
+
+# Geo & Maps
+geopy==2.4.1
+googlemaps==4.10.0
+polyline==2.0.2
+
+# Notifications
+firebase-admin==6.6.0
+twilio==9.4.0
+aiosmtplib==3.0.2
+
+# Storage
+boto3==1.35.86
+
+# Payments
+stripe==11.4.0
+razorpay==1.4.2
+
+# WebSocket
+websockets==14.1
+
+# Utils
+httpx==0.28.1
+python-dateutil==2.9.0.post0
+pytz==2024.2
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+httpx==0.28.1
+factory-boy==3.3.1
+
+# Logging
+structlog==24.4.0
+
+# Linting & formatting
+ruff==0.8.4
+black==24.10.0
