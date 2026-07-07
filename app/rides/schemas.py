@@ -90,6 +90,9 @@ class RideResponse(BaseSchema):
     estimated_duration_min: float
     estimated_fare: float
     final_fare: Optional[float] = None
+    driver_commission_percentage: Optional[float] = None
+    driver_earning: Optional[float] = None
+    company_earning: Optional[float] = None
     payment_method: str
     created_at: datetime
     accepted_at: Optional[datetime] = None

@@ -116,6 +116,14 @@ class NotificationService:
             "estimated_fare": fare,
             "status": ride.status,
         }
+        if ride.vehicle_type:
+            data["vehicle_type"] = {
+                "id": str(ride.vehicle_type.id),
+                "name": ride.vehicle_type.name,
+                "slug": ride.vehicle_type.slug,
+            }
+            data["vehicle_type_slug"] = ride.vehicle_type.slug
+            data["vehicle_type_name"] = ride.vehicle_type.name
         notification = await self.create_in_app(
             title="Ride accepted!",
             message=message,

@@ -423,12 +423,15 @@ class RideService:
         ride.actual_duration_min = ride.estimated_duration_min
         ride.final_fare = ride.estimated_fare
         ride.completed_at = datetime.now(timezone.utc)
-        return await self._transition(
+        ride = await self._transition(
             ride,
             RideStatus.COMPLETED,
             actor_type=ActorType.DRIVER,
             actor_id=driver_id,
         )
+        from app.services.ride_settlement_service import RideSettlementService
+
+        return await RideSettlementService(self.db).settle_completed_ride(ride)
 
     @staticmethod
     def to_response(ride: Ride) -> RideResponse:

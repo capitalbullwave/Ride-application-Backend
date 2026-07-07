@@ -19,16 +19,33 @@ from app.schemas.driver import (
     SaveLicenseNumber,
     SaveLicenseUpload,
     SaveProfileStep,
+    SaveVehicleDocumentsStep,
     SaveVehicleNumberStep,
+    SaveVehicleTypeStep,
 )
 from app.services.driver_bank_service import DriverBankService
 from app.services.image_storage import persist_driver_image
+from app.services.vehicle_document_requirements import (
+    document_label,
+    missing_documents,
+    required_document_types,
+)
 from app.vehicles.models import Vehicle, VehicleType
 
 
 class DriverRegistrationProgressService:
     LICENSE_FRONT = "DRIVING_LICENSE"
     LICENSE_BACK = "DRIVING_LICENSE_BACK"
+
+    VEHICLE_DOC_FIELDS = {
+        "INSURANCE": "insurance_url",
+        "POLLUTION": "pollution_url",
+        "PERMIT": "permit_url",
+        "FITNESS": "fitness_url",
+        "VEHICLE_FRONT": "vehicle_front_url",
+        "VEHICLE_BACK": "vehicle_back_url",
+        "VEHICLE_SIDE": "vehicle_side_url",
+    }
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -46,10 +63,25 @@ class DriverRegistrationProgressService:
         )
         return result.scalar_one_or_none()
 
+    async def _vehicle_type_name(self, vehicle: Vehicle | None) -> str | None:
+        if not vehicle:
+            return None
+        vt_result = await self.db.execute(
+            select(VehicleType).where(VehicleType.id == vehicle.vehicle_type_id)
+        )
+        vehicle_type = vt_result.scalar_one_or_none()
+        return vehicle_type.name if vehicle_type else None
+
     def _doc_url(self, documents: list[DriverDocument], doc_type: str) -> str | None:
         for doc in documents:
             if doc.document_type == doc_type and doc.document_url:
                 return doc.document_url
+        return None
+
+    def _doc_number(self, documents: list[DriverDocument], doc_type: str) -> str | None:
+        for doc in documents:
+            if doc.document_type == doc_type and doc.document_number:
+                return doc.document_number
         return None
 
     def _doc_status(self, documents: list[DriverDocument], doc_type: str) -> str:
@@ -58,24 +90,71 @@ class DriverRegistrationProgressService:
                 return doc.status or KYCStatus.PENDING.value
         return "pending"
 
+    def _uploaded_types(self, documents: list[DriverDocument]) -> set[str]:
+        return {
+            doc.document_type
+            for doc in documents
+            if doc.document_url and doc.document_type
+        }
+
+    def _vehicle_type_selected(self, vehicle: Vehicle | None) -> bool:
+        return vehicle is not None and vehicle.vehicle_type_id is not None
+
+    def _license_done(
+        self, documents: list[DriverDocument], driver: Driver
+    ) -> bool:
+        license_front = self._doc_url(documents, self.LICENSE_FRONT)
+        license_back = self._doc_url(documents, self.LICENSE_BACK)
+        license_number = (driver.license_number or "").strip()
+        return (
+            bool(license_front)
+            and bool(license_back)
+            and license_number not in ("", "PENDING")
+        )
+
+    def _profile_done(self, driver: Driver) -> bool:
+        return (
+            bool((driver.first_name or "").strip())
+            and bool(driver.profile_photo)
+            and driver.date_of_birth is not None
+            and bool((driver.gender or "").strip())
+        )
+
+    def _vehicle_number_done(
+        self, documents: list[DriverDocument], vehicle: Vehicle | None
+    ) -> bool:
+        if not vehicle:
+            return False
+        plate = (vehicle.license_plate or "").strip()
+        if plate in ("", "PENDING"):
+            return False
+        rc_front = self._doc_url(documents, "VEHICLE_RC")
+        rc_back = self._doc_url(documents, "VEHICLE_RC_BACK")
+        return bool(rc_front) and bool(rc_back)
+
+    def _kyc_done(self, documents: list[DriverDocument]) -> bool:
+        aadhaar_front = self._doc_url(documents, "AADHAAR")
+        aadhaar_back = self._doc_url(documents, "AADHAAR_BACK")
+        aadhaar_number = self._doc_number(documents, "AADHAAR")
+        return bool(aadhaar_front) and bool(aadhaar_back) and bool(aadhaar_number)
+
+    def _vehicle_docs_done(
+        self, documents: list[DriverDocument], vehicle_type_name: str | None
+    ) -> bool:
+        uploaded = self._uploaded_types(documents)
+        return len(missing_documents(vehicle_type_name, uploaded)) == 0
+
     async def get_progress(self, driver: Driver) -> DriverRegistrationProgressResponse:
         documents = await self._documents_for(driver.id)
         vehicle = await self._vehicle_for(driver.id)
+        vehicle_type_name = await self._vehicle_type_name(vehicle)
 
-        license_front = self._doc_url(documents, self.LICENSE_FRONT)
-        license_number = (driver.license_number or "").strip()
-        license_done = bool(license_front) and license_number not in ("", "PENDING")
-
-        profile_done = bool((driver.first_name or "").strip()) and bool(
-            driver.profile_photo
-        )
-
-        vehicle_done = bool(vehicle and (vehicle.license_plate or "").strip())
-        vehicle_type_label = vehicle.model if vehicle else None
-
-        aadhaar_done = bool(self._doc_url(documents, "AADHAAR"))
-        pan_done = bool(self._doc_url(documents, "PAN"))
-        kyc_done = aadhaar_done or pan_done
+        vehicle_done = self._vehicle_type_selected(vehicle)
+        license_done = self._license_done(documents, driver)
+        profile_done = self._profile_done(driver)
+        vehicle_number_done = self._vehicle_number_done(documents, vehicle)
+        kyc_done = self._kyc_done(documents)
+        vehicle_docs_done = self._vehicle_docs_done(documents, vehicle_type_name)
 
         submitted = driver.kyc_status in (
             KYCStatus.SUBMITTED.value,
@@ -96,9 +175,14 @@ class DriverRegistrationProgressService:
         steps = [
             RegistrationStepInfo(
                 id="vehicle",
-                completed=vehicle is not None,
-                status=step_status(vehicle is not None),
-                subtitle="Selected" if vehicle_type_label else None,
+                completed=vehicle_done,
+                status=step_status(vehicle_done),
+                subtitle=vehicle_type_name if vehicle_done else None,
+            ),
+            RegistrationStepInfo(
+                id="photo_name",
+                completed=profile_done,
+                status=step_status(profile_done),
             ),
             RegistrationStepInfo(
                 id="license",
@@ -109,19 +193,26 @@ class DriverRegistrationProgressService:
                 ),
             ),
             RegistrationStepInfo(
-                id="photo_name",
-                completed=profile_done,
-                status=step_status(profile_done),
-            ),
-            RegistrationStepInfo(
                 id="vehicle_number",
-                completed=vehicle_done,
-                status=step_status(vehicle_done, ["VEHICLE_RC"]),
+                completed=vehicle_number_done,
+                status=step_status(
+                    vehicle_number_done,
+                    ["VEHICLE_RC", "VEHICLE_RC_BACK"],
+                ),
             ),
             RegistrationStepInfo(
                 id="kyc",
                 completed=kyc_done,
-                status=step_status(kyc_done, ["AADHAAR", "PAN"]),
+                status=step_status(kyc_done, ["AADHAAR", "AADHAAR_BACK"]),
+            ),
+            RegistrationStepInfo(
+                id="vehicle_docs",
+                completed=vehicle_docs_done,
+                status=step_status(
+                    vehicle_docs_done,
+                    required_document_types(vehicle_type_name),
+                ),
+                subtitle=vehicle_type_name,
             ),
         ]
 
@@ -180,11 +271,7 @@ class DriverRegistrationProgressService:
 
         if vehicle:
             vehicle_type_id = str(vehicle.vehicle_type_id)
-            vt_result = await self.db.execute(
-                select(VehicleType).where(VehicleType.id == vehicle.vehicle_type_id)
-            )
-            vehicle_type = vt_result.scalar_one_or_none()
-            vehicle_type_name = vehicle_type.name if vehicle_type else None
+            vehicle_type_name = await self._vehicle_type_name(vehicle)
 
         doc_map: dict[str, SavedDocumentInfo] = {}
         for doc in documents:
@@ -200,6 +287,12 @@ class DriverRegistrationProgressService:
         if license_number in ("", "PENDING"):
             license_number = None
 
+        vehicle_number = None
+        if vehicle:
+            plate = (vehicle.license_plate or "").strip()
+            if plate and plate != "PENDING":
+                vehicle_number = plate
+
         return DriverSavedRegistrationData(
             first_name=driver.first_name,
             last_name=driver.last_name or "",
@@ -212,7 +305,7 @@ class DriverRegistrationProgressService:
             state=driver.state,
             country=driver.country,
             license_number=license_number,
-            vehicle_number=vehicle.license_plate if vehicle else None,
+            vehicle_number=vehicle_number,
             vehicle_type_id=vehicle_type_id,
             vehicle_type_name=vehicle_type_name,
             documents=doc_map,
@@ -268,22 +361,49 @@ class DriverRegistrationProgressService:
         return {"license_number": driver.license_number}
 
     async def save_profile(self, driver: Driver, data: SaveProfileStep) -> dict:
+        if not data.date_of_birth:
+            raise ValidationException("Date of birth is required")
+        if not (data.gender or "").strip():
+            raise ValidationException("Gender is required")
+        if not data.profile_photo:
+            raise ValidationException("Profile photo is required")
+
         driver.first_name = data.first_name.strip()
         driver.last_name = (data.last_name or "").strip()
         driver.date_of_birth = data.date_of_birth
-        driver.gender = data.gender
+        driver.gender = data.gender.strip()
         if data.city:
             driver.city = data.city.strip()
         if data.state:
             driver.state = data.state.strip()
         if data.country:
             driver.country = data.country.strip()
-        if data.profile_photo:
-            stored = persist_driver_image(data.profile_photo, str(driver.id), "selfie")
-            if stored:
-                driver.profile_photo = stored
+        stored = persist_driver_image(data.profile_photo, str(driver.id), "selfie")
+        if stored:
+            driver.profile_photo = stored
         await self.driver_repo.update(driver)
         return {"message": "Profile saved"}
+
+    async def save_vehicle_type(self, driver: Driver, data: SaveVehicleTypeStep) -> dict:
+        vehicle = await self._vehicle_for(driver.id)
+        if vehicle:
+            vehicle.vehicle_type_id = data.vehicle_type_id
+        else:
+            vehicle = Vehicle(
+                driver_id=driver.id,
+                vehicle_type_id=data.vehicle_type_id,
+                license_plate="PENDING",
+                make="Standard",
+                model="Standard",
+                color="Unknown",
+                year=datetime.now(timezone.utc).year,
+            )
+            self.db.add(vehicle)
+        await self.db.flush()
+        return {
+            "vehicle_id": str(vehicle.id),
+            "vehicle_type_id": str(vehicle.vehicle_type_id),
+        }
 
     async def save_vehicle_number(self, driver: Driver, data: SaveVehicleNumberStep) -> dict:
         vehicle = await self._vehicle_for(driver.id)
@@ -305,10 +425,13 @@ class DriverRegistrationProgressService:
             )
             self.db.add(vehicle)
 
-        if data.rc_front_url:
-            await self._upsert_document(driver.id, "VEHICLE_RC", data.rc_front_url)
-        if data.rc_back_url:
-            await self._upsert_document(driver.id, "VEHICLE_RC_BACK", data.rc_back_url)
+        if not data.rc_front_url:
+            raise ValidationException("RC front image is required")
+        if not data.rc_back_url:
+            raise ValidationException("RC back image is required")
+
+        await self._upsert_document(driver.id, "VEHICLE_RC", data.rc_front_url)
+        await self._upsert_document(driver.id, "VEHICLE_RC_BACK", data.rc_back_url)
 
         await self.db.flush()
         return {
@@ -316,7 +439,36 @@ class DriverRegistrationProgressService:
             "license_plate": vehicle.license_plate,
         }
 
+    async def save_vehicle_documents(
+        self, driver: Driver, data: SaveVehicleDocumentsStep
+    ) -> dict:
+        vehicle = await self._vehicle_for(driver.id)
+        if not vehicle:
+            raise ValidationException("Select vehicle type before uploading documents")
+
+        vehicle_type_name = await self._vehicle_type_name(vehicle)
+        saved: list[str] = []
+
+        for doc_type, field_name in self.VEHICLE_DOC_FIELDS.items():
+            url = getattr(data, field_name, None)
+            if url:
+                await self._upsert_document(driver.id, doc_type, url)
+                saved.append(doc_type)
+
+        uploaded = self._uploaded_types(await self._documents_for(driver.id))
+        missing = missing_documents(vehicle_type_name, uploaded)
+
+        return {
+            "saved": saved,
+            "vehicle_type": vehicle_type_name,
+            "complete": len(missing) == 0,
+            "missing": missing,
+        }
+
     async def save_kyc(self, driver: Driver, data: SaveKycStep) -> dict:
+        if data.id_type == "AADHAAR" and not data.back_url:
+            raise ValidationException("Aadhaar back image is required")
+
         front_type = data.id_type
         back_type = f"{data.id_type}_BACK" if data.id_type == "AADHAAR" else None
 
@@ -334,20 +486,34 @@ class DriverRegistrationProgressService:
     async def submit(self, driver: Driver) -> dict:
         documents = await self._documents_for(driver.id)
         vehicle = await self._vehicle_for(driver.id)
+        vehicle_type_name = await self._vehicle_type_name(vehicle)
 
-        license_front = self._doc_url(documents, self.LICENSE_FRONT)
-        license_number = (driver.license_number or "").strip()
-        if not license_front or license_number in ("", "PENDING"):
-            raise ValidationException("Driving license upload and number are required")
-        if not driver.profile_photo or not (driver.first_name or "").strip():
-            raise ValidationException("Profile photo and name are required")
-        if not vehicle or not (vehicle.license_plate or "").strip():
-            raise ValidationException("Vehicle number is required")
-
-        aadhaar = self._doc_url(documents, "AADHAAR")
-        pan = self._doc_url(documents, "PAN")
-        if not aadhaar and not pan:
-            raise ValidationException("Aadhaar or PAN document is required")
+        if not self._vehicle_type_selected(vehicle):
+            raise ValidationException("Vehicle type is required")
+        if not self._profile_done(driver):
+            raise ValidationException(
+                "Profile photo, name, date of birth and gender are required"
+            )
+        if not self._license_done(documents, driver):
+            raise ValidationException(
+                "Driving license front, back and number are required"
+            )
+        if not self._vehicle_number_done(documents, vehicle):
+            raise ValidationException(
+                "Vehicle number with RC front and back is required"
+            )
+        if not self._kyc_done(documents):
+            raise ValidationException(
+                "Aadhaar front, back and number are required"
+            )
+        if not self._vehicle_docs_done(documents, vehicle_type_name):
+            missing = missing_documents(
+                vehicle_type_name, self._uploaded_types(documents)
+            )
+            labels = ", ".join(document_label(t) for t in missing)
+            raise ValidationException(
+                f"Upload all required vehicle documents: {labels}"
+            )
 
         driver.kyc_status = KYCStatus.SUBMITTED.value
         await self.driver_repo.update(driver)

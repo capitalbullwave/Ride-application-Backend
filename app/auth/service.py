@@ -87,19 +87,19 @@ class AuthService:
     _DEV_HARDCODED_OTP = "123456"
 
     async def _issue_phone_otp(self, phone: str) -> str | None:
-        """Send OTP via Twilio Verify, or return a local OTP for dev fallback."""
+        """Send OTP via Twilio Verify when configured; otherwise local/dev fallback."""
+        if self._twilio_otp().is_configured:
+            self._twilio_otp().send_otp(phone)
+            return None
+
         if settings.is_development:
             logger.warning(
                 "dev_otp_hardcoded",
                 phone=phone,
                 otp=self._DEV_HARDCODED_OTP,
-                hint="Development mode — using hardcoded OTP 123456.",
+                hint="Twilio not configured — using hardcoded OTP 123456.",
             )
             return self._DEV_HARDCODED_OTP
-
-        if self._twilio_otp().is_configured:
-            self._twilio_otp().send_otp(phone)
-            return None
 
         otp = generate_otp()
         return otp
@@ -111,16 +111,10 @@ class AuthService:
         stored_otp: str | None,
         stored_expires_at: datetime | None,
     ) -> None:
-        if settings.is_development:
-            if not stored_otp or stored_otp != submitted_otp:
-                raise ValidationException("Invalid OTP")
-            if stored_expires_at and stored_expires_at < datetime.now(timezone.utc):
-                raise ValidationException("OTP expired")
-            return
-
         if self._twilio_otp().is_configured:
             self._twilio_otp().verify_otp(phone, submitted_otp)
             return
+
         if not stored_otp or stored_otp != submitted_otp:
             raise ValidationException("Invalid OTP")
         if stored_expires_at and stored_expires_at < datetime.now(timezone.utc):

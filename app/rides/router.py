@@ -3,10 +3,14 @@ from typing import Annotated, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import get_current_driver, get_current_token, get_current_user, get_optional_current_user
+from app.api.websocket.manager import manager
 from app.core.constants import UserRole
 from app.core.exceptions import ForbiddenException, NotFoundException
+from app.core.logging import get_logger
+from app.database.session import get_db
 from app.models import Driver, User
 from app.rides.dependencies import get_ride_service
 from app.rides.schemas import (
@@ -20,6 +24,9 @@ from app.rides.schemas import (
     RideResponse,
 )
 from app.rides.service import RideService
+from app.services.driver_matching import DriverMatchingService
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["Rides"])
 
@@ -49,8 +56,23 @@ async def book_ride(
     payload: RideBookRequest,
     user: Annotated[User, Depends(get_current_user)],
     service: Annotated[RideService, Depends(get_ride_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     ride = await service.book(user.id, payload)
+    logger.info(
+        "ride_book_requested",
+        ride_id=str(ride.id),
+        user_id=str(user.id),
+        vehicle_type_id=str(payload.vehicle_type_id),
+        source="rides_router",
+    )
+    notified = await DriverMatchingService(db).dispatch_ride_to_online_drivers(ride, manager)
+    logger.info(
+        "ride_driver_search_dispatched",
+        ride_id=str(ride.id),
+        drivers_notified=notified,
+        source="rides_router",
+    )
     return RideService.to_response(ride)
 
 

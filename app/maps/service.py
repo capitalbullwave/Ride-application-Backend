@@ -1,4 +1,5 @@
 """Google Maps integration service."""
+import re
 from typing import Optional
 
 import httpx
@@ -13,6 +14,21 @@ class MapsService:
 
     def __init__(self):
         self.api_key = settings.google_maps_api_key
+
+    @staticmethod
+    def _parse_lat_lng_query(value: str) -> Optional[dict]:
+        match = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", value.strip())
+        if not match:
+            return None
+        lat = float(match.group(1))
+        lng = float(match.group(2))
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return None
+        return {
+            "lat": lat,
+            "lng": lng,
+            "formatted_address": value.strip(),
+        }
 
     async def search_places(
         self,
@@ -124,6 +140,10 @@ class MapsService:
         trimmed = address.strip()
         if not trimmed:
             return None
+
+        coords = self._parse_lat_lng_query(trimmed)
+        if coords:
+            return coords
 
         if self.api_key:
             google = await self._google_geocode(trimmed)

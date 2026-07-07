@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.driver.dependencies import get_current_driver
 from app.core.constants import DriverStatus, KYCStatus, PaymentStatus, RideStatus, SupportTicketPriority, SupportTicketStatus
 from app.core.exceptions import ForbiddenException, NotFoundException, ValidationException
+from app.core.logging import get_logger
 from app.database.session import get_db
 from app.models import Driver, DriverDocument, Notification, Ride, SupportTicket, Vehicle, WalletTransaction
 from app.repositories.driver_repository import DriverRepository
@@ -34,7 +35,9 @@ from app.schemas.driver import (
     SaveLicenseNumber,
     SaveLicenseUpload,
     SaveProfileStep,
+    SaveVehicleDocumentsStep,
     SaveVehicleNumberStep,
+    SaveVehicleTypeStep,
 )
 from app.services.driver_registration_service import DriverRegistrationService
 from app.services.driver_registration_progress_service import (
@@ -47,6 +50,8 @@ from app.services.driver_emergency_contact_service import (
     contact_to_response,
 )
 from app.services.driver_matching import DriverMatchingService
+
+logger = get_logger(__name__)
 from app.services.payment_service import PaymentService, WalletService
 from app.services.ride_service import RideService
 from app.api.websocket.manager import manager
@@ -71,7 +76,11 @@ async def _load_driver_ride(db: AsyncSession, ride_id: UUID) -> Ride:
 
     loaded = await db.execute(
         select(Ride)
-        .options(selectinload(Ride.user), selectinload(Ride.vehicle))
+        .options(
+            selectinload(Ride.user),
+            selectinload(Ride.vehicle),
+            selectinload(Ride.vehicle_type),
+        )
         .where(Ride.id == ride_id)
     )
     return loaded.scalar_one()
@@ -79,12 +88,15 @@ async def _load_driver_ride(db: AsyncSession, ride_id: UUID) -> Ride:
 
 def _payment_breakdown_payload(ride: Ride, payment_method: str | None = None) -> dict:
     fare = float(ride.final_fare or ride.estimated_fare or 0)
-    commission = round(fare * 0.2, 2)
+    commission_pct = float(ride.driver_commission_percentage or 0)
+    driver_earning = float(ride.driver_earning or 0)
+    company_earning = float(ride.company_earning or 0)
     return {
         "trip_fare": fare,
-        "commission": commission,
+        "commission": company_earning,
+        "commission_percentage": commission_pct,
         "bonus": 0.0,
-        "total_earnings": round(fare - commission, 2),
+        "total_earnings": driver_earning,
         "payment_mode": payment_method or ride.payment_method or "CASH",
         "final_fare": fare,
         "estimated_fare": ride.estimated_fare,
@@ -92,35 +104,13 @@ def _payment_breakdown_payload(ride: Ride, payment_method: str | None = None) ->
     }
 
 
-async def _credit_driver_for_ride(db: AsyncSession, driver: Driver, ride: Ride) -> float:
-    fare = float(ride.final_fare or ride.estimated_fare or 0)
-    if fare <= 0:
-        return 0.0
+async def _ensure_ride_settled(db: AsyncSession, ride: Ride) -> Ride:
+    """Idempotent settlement if ride completed before settlement ran."""
+    if ride.driver_earning is not None:
+        return ride
+    from app.services.ride_settlement_service import RideSettlementService
 
-    driver_share = round(fare * 0.85, 2)
-    wallet = await WalletService(db).get_or_create_wallet(driver_id=driver.id)
-    await WalletService(db).credit(
-        wallet.id,
-        driver_share,
-        f"Earnings for ride {str(ride.id)[:8]}",
-        str(ride.id),
-    )
-    notif = NotificationService(db)
-    await notif.create_in_app(
-        title="Ride earnings credited",
-        message=f"₹{driver_share:.2f} added to your wallet.",
-        notification_type="PAYMENT",
-        driver_id=driver.id,
-        data={"ride_id": str(ride.id), "amount": driver_share},
-    )
-    await notif.create_in_app(
-        title="Rate your driver",
-        message="How was your trip? Tap to rate your captain.",
-        notification_type="RIDE",
-        user_id=ride.user_id,
-        data={"ride_id": str(ride.id), "event": "rate_driver"},
-    )
-    return driver_share
+    return await RideSettlementService(db).settle_completed_ride(ride)
 
 
 class AcceptRideRequest(BaseModel):
@@ -230,6 +220,15 @@ async def registration_profile(
     return await DriverRegistrationProgressService(db).save_profile(driver, data)
 
 
+@router.post("/registration/vehicle-type")
+async def registration_vehicle_type(
+    data: SaveVehicleTypeStep,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    return await DriverRegistrationProgressService(db).save_vehicle_type(driver, data)
+
+
 @router.post("/registration/vehicle")
 async def registration_vehicle(
     data: SaveVehicleNumberStep,
@@ -237,6 +236,17 @@ async def registration_vehicle(
     db: AsyncSession = Depends(get_db),
 ):
     return await DriverRegistrationProgressService(db).save_vehicle_number(driver, data)
+
+
+@router.post("/registration/vehicle-documents")
+async def registration_vehicle_documents(
+    data: SaveVehicleDocumentsStep,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    return await DriverRegistrationProgressService(db).save_vehicle_documents(
+        driver, data
+    )
 
 
 @router.post("/registration/kyc")
@@ -369,6 +379,12 @@ async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], 
     for ride in rides:
         await matching.remember_pending_ride(driver.id, ride.id)
 
+    logger.info(
+        "driver_ride_requests",
+        driver_id=str(driver.id),
+        pending_count=len(rides),
+    )
+
     return [
         {
             "id": str(r.id),
@@ -389,7 +405,7 @@ async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], 
             "status": r.status,
             "created_at": r.created_at.isoformat(),
         }
-        for r in result.scalars().all()
+        for r in rides
     ]
 
 
@@ -431,6 +447,14 @@ async def accept_ride(
             raise ValidationException("Vehicle not found for this driver")
 
     ride = await RideService(db).accept_ride(data.ride_id, driver.id, vehicle_id)
+    logger.info(
+        "ride_accepted_by_driver",
+        ride_id=str(data.ride_id),
+        driver_id=str(driver.id),
+        vehicle_id=str(vehicle_id),
+        user_id=str(ride.user_id),
+        status=ride.status,
+    )
 
     loaded = await _load_driver_ride(db, data.ride_id)
     ride = loaded
@@ -453,6 +477,14 @@ async def accept_ride(
         "dropoff_lng": ride.dropoff_lng,
         "estimated_fare": ride.estimated_fare,
     }
+    if ride.vehicle_type:
+        accept_payload["vehicle_type"] = {
+            "id": str(ride.vehicle_type.id),
+            "name": ride.vehicle_type.name,
+            "slug": ride.vehicle_type.slug,
+        }
+        accept_payload["vehicle_type_slug"] = ride.vehicle_type.slug
+        accept_payload["vehicle_type_name"] = ride.vehicle_type.name
     # Push to user immediately over websocket before slower side effects.
     await manager.send_personal(str(ride.user_id), accept_payload)
     await manager.broadcast_ride(str(data.ride_id), accept_payload)
@@ -547,6 +579,7 @@ async def end_ride(
     if ride.driver_id != driver.id:
         raise ForbiddenException("Access denied")
     ride = await RideService(db).complete_ride(data.ride_id)
+    ride = await _ensure_ride_settled(db, ride)
     driver.total_rides = (driver.total_rides or 0) + 1
     await DriverRepository(db).update(driver)
     await manager.broadcast_ride(str(data.ride_id), {"event": "ride_completed", "ride_id": str(data.ride_id)})
@@ -604,7 +637,7 @@ async def collect_payment(
         payment = await payment_service.process_payment(ride.id, ride.user_id, fare, PaymentMethod.CASH.value)
         ride.payment_method = PaymentMethod.CASH.value
         await db.flush()
-        await _credit_driver_for_ride(db, driver, ride)
+        ride = await _ensure_ride_settled(db, ride)
         await db.commit()
         payload = _payment_breakdown_payload(ride, PaymentMethod.CASH.value)
         payload.update(
@@ -630,6 +663,7 @@ async def collect_payment(
             "payment_link_id": qr_data.get("payment_link_id") or qr_data.get("qr_code_id"),
             "short_url": qr_data.get("short_url"),
             "image_url": qr_data.get("image_url"),
+            "image_content": qr_data.get("image_content"),
             "amount": fare,
             "key_id": qr_data.get("key_id"),
         }
@@ -655,7 +689,7 @@ async def collect_payment_status(
     if payment.status != PaymentStatus.COMPLETED.value:
         payment = await payment_service.refresh_ride_qr_payment(ride_id)
         if payment.status == PaymentStatus.COMPLETED.value:
-            await _credit_driver_for_ride(db, driver, ride)
+            ride = await _ensure_ride_settled(db, ride)
             await db.commit()
 
     payload = _payment_breakdown_payload(ride, payment.payment_method)
@@ -686,6 +720,45 @@ async def rate_passenger(
     return await RatingService(db).rate_user(ride_id, driver, data.rating, data.comment)
 
 
+class RideChatMessageRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+
+
+@router.get("/ride/{ride_id}/messages")
+async def list_ride_messages_driver(
+    ride_id: UUID,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.rides.chat_service import RideChatService
+
+    ride = await RideService(db).get_ride(ride_id)
+    if ride.driver_id != driver.id:
+        raise ForbiddenException("Access denied")
+    service = RideChatService(db)
+    return {"success": True, "data": await service.list_messages(ride_id)}
+
+
+@router.post("/ride/{ride_id}/messages")
+async def send_ride_message_driver(
+    ride_id: UUID,
+    data: RideChatMessageRequest,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.rides.chat_service import RideChatService
+
+    service = RideChatService(db)
+    message = await service.send_message(
+        ride_id,
+        sender_id=driver.id,
+        sender_type="driver",
+        message=data.message,
+    )
+    await db.commit()
+    return {"success": True, "data": message}
+
+
 @router.get("/dashboard", response_model=DriverDashboardResponse)
 async def driver_dashboard(
     driver: Annotated[Driver, Depends(get_current_driver)],
@@ -700,11 +773,16 @@ async def driver_dashboard(
 @router.get("/wallet")
 async def driver_wallet(driver: Annotated[Driver, Depends(get_current_driver)], db: AsyncSession = Depends(get_db)):
     from app.services.driver_bank_service import DriverBankService, bank_to_response
-    from app.services.payment_service import WalletService
+    from app.services.driver_wallet_service import DriverWalletService
 
-    wallet = await WalletService(db).get_or_create_wallet(driver_id=driver.id)
+    wallet = await DriverWalletService(db).get_or_create(driver.id)
     bank = await DriverBankService(db).get_primary(driver.id)
-    payload: dict = {"balance": wallet.balance}
+    payload: dict = {
+        "available_balance": wallet.available_balance,
+        "pending_balance": wallet.pending_balance,
+        "lifetime_earnings": wallet.lifetime_earnings,
+        "balance": wallet.available_balance,
+    }
     if bank:
         payload["bank"] = bank_to_response(bank).model_dump()
     return payload
@@ -754,32 +832,37 @@ async def driver_wallet_transactions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    from app.services.payment_service import WalletService
+    from app.services.driver_wallet_service import DriverWalletService
 
-    wallet = await WalletService(db).get_or_create_wallet(driver_id=driver.id)
-    result = await db.execute(
-        select(WalletTransaction)
-        .where(WalletTransaction.wallet_id == wallet.id)
-        .order_by(WalletTransaction.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    txns = result.scalars().all()
+    txns, total = await DriverWalletService(db).list_transactions(driver.id, page=page, page_size=page_size)
     return {
         "data": [
             {
                 "id": str(t.id),
-                "type": t.transaction_type.lower(),
+                "type": t.type.lower(),
                 "amount": t.amount,
                 "description": t.description,
-                "reference_id": t.reference_id,
+                "balance_after_transaction": t.balance_after_transaction,
+                "reference_id": str(t.ride_id) if t.ride_id else None,
+                "ride_id": str(t.ride_id) if t.ride_id else None,
                 "created_at": t.created_at.isoformat(),
             }
             for t in txns
         ],
+        "total": total,
         "page": page,
         "page_size": page_size,
     }
+
+
+@router.get("/transactions")
+async def driver_transactions(
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    return await driver_wallet_transactions(driver, db, page, page_size)
 
 
 _DOC_LABELS = {

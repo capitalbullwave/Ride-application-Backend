@@ -14,6 +14,7 @@ from app.auth.service import AuthService
 from app.core.constants import DriverStatus, KYCStatus, RideStatus
 from app.core.exceptions import NotFoundException
 from app.database.session import get_db
+from app.commission.models import DriverWallet
 from app.models import AdminUser, Driver, DriverDocument, Ride, User, Vehicle, Wallet, WalletTransaction, Notification, SupportTicket
 from app.drivers.models import DriverBankAccount
 from app.schemas.admin import AdminLogin
@@ -93,6 +94,7 @@ def _map_driver(
     vehicle: Vehicle | None = None,
     wallet_balance: float = 0.0,
     bank: DriverBankAccount | None = None,
+    commission_earnings: float = 0.0,
 ) -> dict:
     vehicle_type = "sedan"
     vehicle_number = ""
@@ -125,7 +127,7 @@ def _map_driver(
         "vehicleStatus": vehicle_status,
         "rating": driver.rating_avg,
         "totalTrips": driver.total_rides,
-        "earnings": 0.0,
+        "earnings": commission_earnings,
         "walletBalance": wallet_balance,
         "status": _driver_status(driver),
         "avatar": driver.profile_photo,
@@ -158,10 +160,27 @@ def _map_driver(
 
 async def _driver_wallet_balance(db: AsyncSession, driver_id: UUID) -> float:
     result = await db.execute(
-        select(Wallet.balance).where(Wallet.driver_id == driver_id, Wallet.is_active == True)
+        select(DriverWallet.available_balance).where(DriverWallet.driver_id == driver_id)
     )
     balance = result.scalar_one_or_none()
-    return float(balance or 0.0)
+    if balance is not None:
+        return float(balance)
+
+    legacy = await db.execute(
+        select(Wallet.balance).where(Wallet.driver_id == driver_id, Wallet.is_active == True)
+    )
+    return float(legacy.scalar_one_or_none() or 0.0)
+
+
+async def _driver_commission_earnings(db: AsyncSession, driver_id: UUID) -> float:
+    result = await db.execute(
+        select(func.coalesce(func.sum(Ride.driver_earning), 0.0)).where(
+            Ride.driver_id == driver_id,
+            Ride.status == RideStatus.COMPLETED.value,
+            Ride.driver_earning.isnot(None),
+        )
+    )
+    return float(result.scalar_one() or 0.0)
 
 
 def _map_ride(ride: Ride, user: User | None = None, driver: Driver | None = None) -> dict:
@@ -185,6 +204,9 @@ def _map_ride(ride: Ride, user: User | None = None, driver: Driver | None = None
         "dropLocation": ride.dropoff_address,
         "distance": ride.actual_distance_km or ride.estimated_distance_km,
         "fare": ride.final_fare or ride.estimated_fare,
+        "driverCommissionPercentage": ride.driver_commission_percentage,
+        "driverEarning": ride.driver_earning,
+        "companyEarning": ride.company_earning,
         "status": status_map.get(ride.status, ride.status.lower()),
         "date": ride.created_at.isoformat(),
         "duration": int(ride.actual_duration_min or ride.estimated_duration_min),
@@ -519,7 +541,8 @@ async def list_drivers(
         )
         vehicle = vehicle_result.scalar_one_or_none()
         wallet_balance = await _driver_wallet_balance(db, d.id)
-        mapped = _map_driver(d, vehicle, wallet_balance)
+        commission_earnings = await _driver_commission_earnings(db, d.id)
+        mapped = _map_driver(d, vehicle, wallet_balance, commission_earnings=commission_earnings)
         if status and status != "all" and mapped["status"] != status:
             continue
         items.append(mapped)
@@ -551,6 +574,7 @@ async def get_driver(
     )
     vehicle = vehicle_result.scalar_one_or_none()
     wallet_balance = await _driver_wallet_balance(db, driver.id)
+    commission_earnings = await _driver_commission_earnings(db, driver.id)
     bank_result = await db.execute(
         select(DriverBankAccount)
         .where(DriverBankAccount.driver_id == driver.id)
@@ -558,7 +582,7 @@ async def get_driver(
         .limit(1)
     )
     bank = bank_result.scalar_one_or_none()
-    return _map_driver(driver, vehicle, wallet_balance, bank)
+    return _map_driver(driver, vehicle, wallet_balance, bank, commission_earnings)
 
 
 @router.patch("/drivers/{driver_id}")

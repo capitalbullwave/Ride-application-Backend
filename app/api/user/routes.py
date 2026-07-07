@@ -12,6 +12,7 @@ from app.api.user.dependencies import get_current_user
 from app.api.user.service import UserApiService
 from app.core.constants import RideStatus, SupportTicketPriority, SupportTicketStatus
 from app.core.exceptions import ForbiddenException, NotFoundException, ValidationException
+from app.core.logging import get_logger
 from app.database.session import get_db
 from app.models import Notification, Rating, Ride, SavedAddress, StudentPass, SubscriptionPlan, SupportTicket, SupportTicketReply, User, UserSubscription, VehicleType
 from app.repositories.ride_repository import RideRepository
@@ -33,6 +34,8 @@ from app.services.subscription_payment_service import (
 )
 from app.services.wallet_payment_service import WalletPaymentService
 from app.api.websocket.manager import manager
+
+logger = get_logger(__name__)
 from app.utils.phone import format_phone_display
 
 router = APIRouter(tags=["User"])
@@ -170,6 +173,17 @@ def _ride_summary(ride: Ride) -> dict:
     }
 
 
+def _serialize_vehicle_type(ride: Ride) -> dict | None:
+    vt = ride.vehicle_type
+    if vt is None:
+        return None
+    return {
+        "id": str(vt.id),
+        "name": vt.name,
+        "slug": vt.slug,
+    }
+
+
 def _active_ride_summary(ride: Ride) -> dict:
     summary = _ride_summary(ride)
     summary["pickup_lat"] = ride.pickup_lat
@@ -185,6 +199,11 @@ def _active_ride_summary(ride: Ride) -> dict:
         }
     if ride.vehicle:
         summary["vehicle_number"] = ride.vehicle.license_plate
+    vehicle_type = _serialize_vehicle_type(ride)
+    if vehicle_type:
+        summary["vehicle_type"] = vehicle_type
+        summary["vehicle_type_slug"] = vehicle_type["slug"]
+        summary["vehicle_type_name"] = vehicle_type["name"]
     if ride.ride_otp and ride.status in (
         RideStatus.DRIVER_ASSIGNED.value,
         RideStatus.DRIVER_ARRIVED.value,
@@ -371,7 +390,21 @@ async def book_ride(
         scheduled_at=data.scheduled_at,
     )
     ride = await RideService(db).create_ride(user.id, ride_data)
+    logger.info(
+        "ride_book_requested",
+        ride_id=str(ride.id),
+        user_id=str(user.id),
+        vehicle_type_id=str(vehicle_type_id),
+        pickup_address=data.pickup_address,
+        dropoff_address=data.dropoff_address,
+        status=ride.status,
+    )
     notified = await DriverMatchingService(db).dispatch_ride_to_online_drivers(ride, manager)
+    logger.info(
+        "ride_driver_search_dispatched",
+        ride_id=str(ride.id),
+        drivers_notified=notified,
+    )
     await manager.broadcast_ride(str(ride.id), {
         "event": "ride_requested",
         "ride_id": str(ride.id),
@@ -400,7 +433,11 @@ async def list_rides(
 
         loaded = await db.execute(
             select(Ride)
-            .options(selectinload(Ride.driver), selectinload(Ride.vehicle))
+            .options(
+                selectinload(Ride.driver),
+                selectinload(Ride.vehicle),
+                selectinload(Ride.vehicle_type),
+            )
             .where(Ride.id == active.id)
         )
         active_ride = loaded.scalar_one_or_none()
@@ -611,6 +648,47 @@ async def rate_ride(
     from app.services.rating_service import RatingService
 
     return await RatingService(db).rate_driver(ride_id, user, data.rating, data.comment)
+
+
+class RideChatMessageRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1000)
+
+
+@router.get("/ride/{ride_id}/messages")
+async def list_ride_messages_user(
+    ride_id: UUID,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.rides.chat_service import RideChatService
+
+    ride = await db.get(Ride, ride_id)
+    if not ride:
+        raise NotFoundException("Ride not found")
+    if ride.user_id != user.id:
+        raise ForbiddenException("Access denied")
+    service = RideChatService(db)
+    return {"success": True, "data": await service.list_messages(ride_id)}
+
+
+@router.post("/ride/{ride_id}/messages")
+async def send_ride_message_user(
+    ride_id: UUID,
+    data: RideChatMessageRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.rides.chat_service import RideChatService
+
+    service = RideChatService(db)
+    message = await service.send_message(
+        ride_id,
+        sender_id=user.id,
+        sender_type="user",
+        message=data.message,
+    )
+    await db.commit()
+    return {"success": True, "data": message}
 
 
 @router.post("/support")

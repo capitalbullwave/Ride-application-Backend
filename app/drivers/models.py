@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from app.rides.models import Ride
     from app.support.models import SupportTicket
     from app.vehicles.models import Vehicle
+    from app.commission.models import DriverWallet
     from app.wallet.models import Wallet, WithdrawalRequest
 
 
@@ -59,6 +60,9 @@ class Driver(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     vehicles: Mapped[List["Vehicle"]] = relationship("Vehicle", back_populates="driver")
     rides: Mapped[List["Ride"]] = relationship("Ride", back_populates="driver", foreign_keys="Ride.driver_id")
     wallet: Mapped[Optional["Wallet"]] = relationship("Wallet", back_populates="driver", uselist=False)
+    driver_wallet: Mapped[Optional["DriverWallet"]] = relationship(
+        "DriverWallet", back_populates="driver", uselist=False
+    )
     location: Mapped[Optional["DriverLocation"]] = relationship(
         "DriverLocation", back_populates="driver", uselist=False
     )

@@ -82,5 +82,6 @@ celerybeat.pid
 Thumbs.db
 Desktop.ini
 
-# Docker local overrides
+# Docker
+docker/
 docker-compose.override.yml

@@ -98,8 +98,23 @@ class RazorpayGateway(PaymentGateway):
     async def create_qr_payment(self, amount: float, metadata: dict) -> dict:
         amount_paise = max(int(round(amount * 100)), 100)
         ride_id = str(metadata.get("ride_id") or "")
+        settings = get_settings()
 
-        def _create() -> dict:
+        def _create_upi_qr() -> dict:
+            client = _razorpay_client()
+            return client.qrcode.create(
+                {
+                    "type": "upi_qr",
+                    "name": f"Ride {ride_id[:8] or 'fare'}",
+                    "usage": "single_use",
+                    "fixed_amount": True,
+                    "payment_amount": amount_paise,
+                    "description": "Ride fare payment",
+                    "notes": {"ride_id": ride_id},
+                }
+            )
+
+        def _create_payment_link() -> dict:
             client = _razorpay_client()
             return client.payment_link.create(
                 {
@@ -111,42 +126,82 @@ class RazorpayGateway(PaymentGateway):
                 }
             )
 
-        link = await asyncio.to_thread(_create)
-        settings = get_settings()
-        short_url = link.get("short_url") or ""
-        link_id = link.get("id")
-        return {
-            "status": "pending",
-            "order_id": link_id,
-            "transaction_id": link_id,
-            "payment_link_id": link_id,
-            "qr_code_id": link_id,
-            "short_url": short_url,
-            "image_url": link.get("image_url"),
-            "key_id": settings.razorpay_key_id,
-        }
+        try:
+            qr = await asyncio.to_thread(_create_upi_qr)
+            qr_id = qr.get("id")
+            image_url = qr.get("image_url") or ""
+            return {
+                "status": "pending",
+                "payment_type": "qr_code",
+                "order_id": qr_id,
+                "transaction_id": qr_id,
+                "qr_code_id": qr_id,
+                "short_url": image_url,
+                "image_url": image_url or None,
+                "image_content": qr.get("image_content"),
+                "amount_paise": amount_paise,
+                "key_id": settings.razorpay_key_id,
+            }
+        except Exception:
+            link = await asyncio.to_thread(_create_payment_link)
+            link_id = link.get("id")
+            short_url = link.get("short_url") or ""
+            return {
+                "status": "pending",
+                "payment_type": "payment_link",
+                "order_id": link_id,
+                "transaction_id": link_id,
+                "payment_link_id": link_id,
+                "qr_code_id": link_id,
+                "short_url": short_url,
+                "image_url": link.get("image_url"),
+                "amount_paise": amount_paise,
+                "key_id": settings.razorpay_key_id,
+            }
 
     async def verify_payment(self, transaction_id: str) -> dict:
         return await self.check_qr_payment(transaction_id)
 
-    async def check_qr_payment(self, payment_link_id: str) -> dict:
-        def _fetch() -> dict:
+    async def check_qr_payment(self, payment_reference: str) -> dict:
+        def _fetch() -> tuple[str, dict]:
             client = _razorpay_client()
-            return client.payment_link.fetch(payment_link_id)
+            if payment_reference.startswith("qr_"):
+                return "qr_code", client.qrcode.fetch(payment_reference)
+            return "payment_link", client.payment_link.fetch(payment_reference)
 
-        link = await asyncio.to_thread(_fetch)
-        status = (link.get("status") or "").lower()
-        amount_paid = int(link.get("amount_paid") or 0)
+        kind, data = await asyncio.to_thread(_fetch)
+
+        if kind == "qr_code":
+            amount_received = int(data.get("payments_amount_received") or 0)
+            payment_amount = int(data.get("payment_amount") or 0)
+            status = (data.get("status") or "").lower()
+            paid = amount_received > 0 or (
+                payment_amount > 0 and amount_received >= payment_amount
+            ) or status == "closed"
+            if paid:
+                return {
+                    "status": "completed",
+                    "transaction_id": payment_reference,
+                    "gateway_response": data,
+                }
+            return {
+                "status": "pending",
+                "transaction_id": payment_reference,
+                "gateway_response": data,
+            }
+
+        status = (data.get("status") or "").lower()
+        amount_paid = int(data.get("amount_paid") or 0)
         if status == "paid" or amount_paid > 0:
             return {
                 "status": "completed",
-                "transaction_id": payment_link_id,
-                "gateway_response": link,
+                "transaction_id": payment_reference,
+                "gateway_response": data,
             }
         return {
             "status": "pending",
-            "transaction_id": payment_link_id,
-            "gateway_response": link,
+            "transaction_id": payment_reference,
+            "gateway_response": data,
         }
 
     async def refund_payment(self, transaction_id: str, amount: float) -> dict:
@@ -236,6 +291,18 @@ class PaymentService:
         existing = await self.get_ride_payment(ride_id)
         if existing and existing.status == PaymentStatus.COMPLETED.value:
             raise ValidationException("Payment already collected for this ride")
+
+        if (
+            existing
+            and existing.status == PaymentStatus.PENDING.value
+            and existing.payment_method == PaymentMethod.RAZORPAY.value
+            and existing.gateway_response
+            and (
+                existing.gateway_response.get("qr_code_id")
+                or existing.gateway_response.get("payment_link_id")
+            )
+        ):
+            return existing
 
         gateway = RazorpayGateway()
         result = await gateway.create_qr_payment(amount, {"ride_id": str(ride_id), "user_id": str(user_id)})

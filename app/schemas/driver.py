@@ -1,6 +1,6 @@
 import uuid
 from datetime import date, datetime
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -180,12 +180,22 @@ class DriverStatusUpdate(BaseModel):
     status: str
 
 
+class DriverEarningsRideItem(BaseModel):
+    ride_id: uuid.UUID
+    ride_fare: float
+    driver_commission_percentage: float
+    driver_earning: float
+    ride_date: Optional[datetime] = None
+    status: str
+
+
 class DriverEarningsResponse(BaseModel):
     period: str
     total_rides: int
     total_earnings: float
     total_tips: float = 0.0
     net_earnings: float
+    rides: List[DriverEarningsRideItem] = Field(default_factory=list)
 
 
 class DriverDashboardResponse(BaseModel):
@@ -386,6 +396,20 @@ class SaveVehicleNumberStep(BaseModel):
     @classmethod
     def normalize_plate(cls, v: str) -> str:
         return v.strip().upper()
+
+
+class SaveVehicleTypeStep(BaseModel):
+    vehicle_type_id: uuid.UUID
+
+
+class SaveVehicleDocumentsStep(BaseModel):
+    insurance_url: Optional[str] = None
+    pollution_url: Optional[str] = None
+    permit_url: Optional[str] = None
+    fitness_url: Optional[str] = None
+    vehicle_front_url: Optional[str] = None
+    vehicle_back_url: Optional[str] = None
+    vehicle_side_url: Optional[str] = None
 
 
 class SaveKycStep(BaseModel):

@@ -33,6 +33,7 @@ class VehicleType(UUIDMixin, TimestampMixin, Base):
     service_group: Mapped[str] = mapped_column(String(20), default="ride", nullable=False, index=True)
     capacity: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    driver_commission_percentage: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     vehicles: Mapped[List["Vehicle"]] = relationship("Vehicle", back_populates="vehicle_type")
     rides: Mapped[List["Ride"]] = relationship("Ride", back_populates="vehicle_type")

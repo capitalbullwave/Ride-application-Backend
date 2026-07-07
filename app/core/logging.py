@@ -48,8 +48,8 @@ def setup_logging() -> None:
     root.addHandler(handler)
     root.setLevel(log_level)
 
-    for noisy in ("uvicorn.access", "sqlalchemy.engine"):
-        logging.getLogger(noisy).setLevel(logging.WARNING if settings.is_production else logging.INFO)
+    for noisy in ("uvicorn.access", "sqlalchemy.engine", "sqlalchemy.pool"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:

@@ -19,6 +19,11 @@ from app.core.exceptions import ConflictException, NotFoundException, Validation
 from app.database.session import get_db
 from app.services.image_storage import persist_vehicle_type_image
 from app.services.user_benefits_service import map_student_pass, map_subscription_plan
+from app.commission.schemas import (
+    VehicleCommissionSettingsResponse,
+    VehicleCommissionSettingsUpdate,
+)
+from app.services.commission_service import CommissionService
 from app.notifications.service import NotificationService
 from app.subscriptions.models import StudentPass, SubscriptionPlan, UserSubscription
 from app.models import (
@@ -141,6 +146,11 @@ def _map_vehicle_type(vt: VehicleType) -> dict:
         "imageUrl": image_url,
         "capacity": vt.capacity,
         "serviceGroup": vt.service_group or "ride",
+        "driverCommissionPercentage": float(
+            vt.driver_commission_percentage
+            if vt.driver_commission_percentage is not None
+            else CommissionService.DEFAULT_COMMISSION_PERCENTAGE
+        ),
     }
 
 
@@ -257,6 +267,10 @@ async def _get_settings(db: AsyncSession) -> dict:
     result = await db.execute(select(AppSetting))
     settings = {row.key: row.value for row in result.scalars().all()}
     merged = dict(DEFAULT_SETTINGS)
+    commission = await CommissionService(db).get_vehicle_settings_response()
+    merged["driverCommission"] = commission.default_commission_percentage
+    merged["platformFee"] = round(100 - commission.default_commission_percentage, 2)
+    merged["commissionMode"] = "per_vehicle"
     key_map = {
         "app_name": "appName",
         "contact_email": "contactEmail",
@@ -265,17 +279,11 @@ async def _get_settings(db: AsyncSession) -> dict:
         "firebase_config": "firebaseConfig",
         "razorpay_key": "razorpayKey",
         "stripe_key": "stripeKey",
-        "driver_commission": "driverCommission",
-        "platform_fee": "platformFee",
         "logo": "logo",
     }
     for db_key, front_key in key_map.items():
         if db_key in settings:
-            value = settings[db_key]
-            if front_key in ("driverCommission", "platformFee"):
-                merged[front_key] = float(value)
-            else:
-                merged[front_key] = value
+            merged[front_key] = settings[db_key]
     return merged
 
 
@@ -344,6 +352,42 @@ async def dashboard_stats(
         )
     ).scalar_one()
 
+    total_revenue = (
+        await db.execute(
+            select(func.coalesce(func.sum(Ride.final_fare), 0.0)).where(
+                Ride.status == RideStatus.COMPLETED.value,
+            )
+        )
+    ).scalar_one()
+
+    driver_earnings_today = (
+        await db.execute(
+            select(func.coalesce(func.sum(Ride.driver_earning), 0.0)).where(
+                Ride.status == RideStatus.COMPLETED.value,
+                Ride.completed_at >= today,
+            )
+        )
+    ).scalar_one()
+
+    company_earnings_today = (
+        await db.execute(
+            select(func.coalesce(func.sum(Ride.company_earning), 0.0)).where(
+                Ride.status == RideStatus.COMPLETED.value,
+                Ride.completed_at >= today,
+            )
+        )
+    ).scalar_one()
+
+    total_commission_paid = (
+        await db.execute(
+            select(func.coalesce(func.sum(Ride.driver_earning), 0.0)).where(
+                Ride.status == RideStatus.COMPLETED.value,
+            )
+        )
+    ).scalar_one()
+
+    commission_settings = await CommissionService(db).get_vehicle_settings_response()
+
     return {
         "totalUsers": total_users,
         "totalDrivers": total_drivers,
@@ -353,6 +397,12 @@ async def dashboard_stats(
         "cancelledRides": cancelled_rides,
         "todayRevenue": float(today_revenue or 0),
         "monthlyRevenue": float(monthly_revenue or 0),
+        "totalRevenue": float(total_revenue or 0),
+        "driverEarningsToday": float(driver_earnings_today or 0),
+        "companyEarningsToday": float(company_earnings_today or 0),
+        "totalCommissionPaid": float(total_commission_paid or 0),
+        "driverCommissionPercentage": commission_settings.default_commission_percentage,
+        "commissionMode": "per_vehicle",
     }
 
 
@@ -583,6 +633,21 @@ async def get_ride(
     if not ride:
         raise NotFoundException("Ride not found")
     return await _ride_with_names(db, ride)
+
+
+@router.get("/rides/{ride_id}/messages")
+async def list_ride_messages_admin(
+    ride_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.rides.chat_service import RideChatService
+
+    ride = await db.get(Ride, ride_id)
+    if not ride:
+        raise NotFoundException("Ride not found")
+    service = RideChatService(db)
+    return {"success": True, "data": await service.list_messages(ride_id)}
 
 
 @router.get("/users/export")
@@ -1008,6 +1073,123 @@ async def admin_alerts(
     return alerts
 
 
+@router.get("/commission-settings", response_model=VehicleCommissionSettingsResponse)
+async def get_commission_settings(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    return await CommissionService(db).get_vehicle_settings_response()
+
+
+@router.put("/commission-settings", response_model=VehicleCommissionSettingsResponse)
+async def update_commission_settings(
+    data: VehicleCommissionSettingsUpdate,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    return await CommissionService(db).update_vehicle_settings(data, admin.id)
+
+
+@router.get("/reports/revenue")
+async def revenue_report(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    group_by: str = Query("date", pattern="^(date|driver)$"),
+    days: int = Query(30, ge=1, le=365),
+):
+    since = _utc_now() - timedelta(days=days)
+
+    if group_by == "driver":
+        rows = (
+            await db.execute(
+                select(
+                    Ride.driver_id,
+                    func.coalesce(func.sum(Ride.final_fare), 0.0).label("total_ride_revenue"),
+                    func.coalesce(func.sum(Ride.driver_earning), 0.0).label("total_driver_earnings"),
+                    func.coalesce(func.sum(Ride.company_earning), 0.0).label("total_company_earnings"),
+                    func.count(Ride.id).label("completed_rides"),
+                )
+                .where(
+                    Ride.status == RideStatus.COMPLETED.value,
+                    Ride.completed_at >= since,
+                    Ride.driver_id.isnot(None),
+                )
+                .group_by(Ride.driver_id)
+                .order_by(func.sum(Ride.driver_earning).desc())
+            )
+        ).all()
+        return {
+            "groupBy": "driver",
+            "items": [
+                {
+                    "driverId": str(row.driver_id),
+                    "totalRideRevenue": float(row.total_ride_revenue or 0),
+                    "totalDriverEarnings": float(row.total_driver_earnings or 0),
+                    "totalCompanyEarnings": float(row.total_company_earnings or 0),
+                    "completedRides": int(row.completed_rides or 0),
+                }
+                for row in rows
+            ],
+        }
+
+    items = []
+    for i in range(days - 1, -1, -1):
+        day = (_utc_now() - timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day = day + timedelta(days=1)
+        row = (
+            await db.execute(
+                select(
+                    func.coalesce(func.sum(Ride.final_fare), 0.0),
+                    func.coalesce(func.sum(Ride.driver_earning), 0.0),
+                    func.coalesce(func.sum(Ride.company_earning), 0.0),
+                    func.count(Ride.id),
+                ).where(
+                    Ride.status == RideStatus.COMPLETED.value,
+                    Ride.completed_at >= day,
+                    Ride.completed_at < next_day,
+                )
+            )
+        ).one()
+        items.append(
+            {
+                "date": day.date().isoformat(),
+                "totalRideRevenue": float(row[0] or 0),
+                "totalDriverEarnings": float(row[1] or 0),
+                "totalCompanyEarnings": float(row[2] or 0),
+                "completedRides": int(row[3] or 0),
+            }
+        )
+
+    totals = (
+        await db.execute(
+            select(
+                func.coalesce(func.sum(Ride.final_fare), 0.0),
+                func.coalesce(func.sum(Ride.driver_earning), 0.0),
+                func.coalesce(func.sum(Ride.company_earning), 0.0),
+                func.count(Ride.id),
+            ).where(
+                Ride.status == RideStatus.COMPLETED.value,
+                Ride.completed_at >= since,
+            )
+        )
+    ).one()
+
+    commission = await CommissionService(db).get_vehicle_settings_response()
+
+    return {
+        "groupBy": "date",
+        "driverCommissionPercentage": commission.default_commission_percentage,
+        "commissionMode": "per_vehicle",
+        "totals": {
+            "totalRideRevenue": float(totals[0] or 0),
+            "totalDriverEarnings": float(totals[1] or 0),
+            "totalCompanyEarnings": float(totals[2] or 0),
+            "completedRides": int(totals[3] or 0),
+        },
+        "items": items,
+    }
+
+
 @router.get("/settings")
 async def get_settings(admin: Annotated[AdminUser, Depends(get_current_admin)], db: AsyncSession = Depends(get_db)):
     return await _get_settings(db)
@@ -1027,8 +1209,6 @@ async def update_settings(
         "firebaseConfig": "firebase_config",
         "razorpayKey": "razorpay_key",
         "stripeKey": "stripe_key",
-        "driverCommission": "driver_commission",
-        "platformFee": "platform_fee",
         "logo": "logo",
     }
     for front_key, db_key in key_map.items():

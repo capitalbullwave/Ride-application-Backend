@@ -24,6 +24,12 @@ from app.support.models import Faq, SupportTicket, SupportTicketReply
 from app.subscriptions.models import StudentPass, SubscriptionPayment, SubscriptionPlan, UserSubscription
 from app.users.models import SavedAddress, User
 from app.vehicles.models import Vehicle, VehicleType
+from app.commission.models import (
+    CommissionSettings,
+    CompanyRevenueLedger,
+    DriverWallet,
+    DriverWalletTransaction,
+)
 from app.wallet.models import Wallet, WalletTopUpPayment, WalletTransaction, WithdrawalRequest
 
 __all__ = [
@@ -37,11 +43,15 @@ __all__ = [
     "AuthDevice",
     "ChatMessage",
     "City",
+    "CommissionSettings",
+    "CompanyRevenueLedger",
     "Driver",
     "DriverBankAccount",
     "DriverDocument",
     "DriverEmergencyContact",
     "DriverLocation",
+    "DriverWallet",
+    "DriverWalletTransaction",
     "Faq",
     "Notification",
     "OtpLog",

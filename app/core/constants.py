@@ -69,6 +69,15 @@ class WalletTransactionType(str, Enum):
     ADMIN_ADJUSTMENT = "ADMIN_ADJUSTMENT"
 
 
+class DriverWalletTransactionType(str, Enum):
+    CREDIT = "CREDIT"
+    DEBIT = "DEBIT"
+    WITHDRAWAL = "WITHDRAWAL"
+    ADJUSTMENT = "ADJUSTMENT"
+    BONUS = "BONUS"
+    PENALTY = "PENALTY"
+
+
 class DriverStatus(str, Enum):
     OFFLINE = "OFFLINE"
     ONLINE = "ONLINE"

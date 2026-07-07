@@ -8,9 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.settings import settings
 from app.core.constants import DriverStatus, KYCStatus
 from app.core.exceptions import NotFoundException, ValidationException
+from app.core.logging import get_logger
 from app.database.redis import get_redis
 from app.models import Driver, DriverLocation, Ride, Vehicle
 from app.repositories.driver_repository import DriverRepository
+
+logger = get_logger(__name__)
 
 DRIVER_GEO_KEY = "drivers:geo"
 DRIVER_META_PREFIX = "driver:meta:"
@@ -26,7 +29,8 @@ class DriverMatchingService:
     async def _get_redis(self):
         try:
             return await get_redis()
-        except Exception:
+        except Exception as exc:
+            logger.warning("redis_unavailable", error=str(exc))
             return None
 
     async def _persist_driver_location(
@@ -86,8 +90,12 @@ class DriverMatchingService:
                 },
             )
             await redis.expire(f"{DRIVER_META_PREFIX}{driver_id}", 300)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "driver_location_redis_update_failed",
+                driver_id=str(driver_id),
+                error=str(exc),
+            )
 
     async def set_driver_online(self, driver_id: UUID, lat: float, lng: float, vehicle_type_id: str) -> None:
         await self.update_driver_location(driver_id, lat, lng)
@@ -102,10 +110,15 @@ class DriverMatchingService:
                 f"{DRIVER_META_PREFIX}{driver_id}",
                 mapping={"vehicle_type_id": vehicle_type_id, "available": "1"},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "driver_online_redis_update_failed",
+                driver_id=str(driver_id),
+                error=str(exc),
+            )
 
     async def set_driver_offline(self, driver_id: UUID) -> None:
+        logger.info("driver_going_offline", driver_id=str(driver_id))
         redis = await self._get_redis()
         if not redis:
             return
@@ -114,8 +127,12 @@ class DriverMatchingService:
             await redis.zrem(DRIVER_GEO_KEY, str(driver_id))
             await redis.srem("drivers:online", str(driver_id))
             await redis.delete(f"{DRIVER_META_PREFIX}{driver_id}")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "driver_offline_redis_update_failed",
+                driver_id=str(driver_id),
+                error=str(exc),
+            )
 
     async def _online_drivers_from_db(
         self,
@@ -161,9 +178,24 @@ class DriverMatchingService:
         radius_km: Optional[float] = None,
         limit: int = 10,
     ) -> List[dict]:
+        logger.info(
+            "find_nearby_drivers_started",
+            lat=lat,
+            lng=lng,
+            vehicle_type_id=vehicle_type_id,
+            radius_km=radius_km or settings.driver_search_radius_km,
+            limit=limit,
+        )
         redis = await self._get_redis()
         if not redis:
-            return await self._online_drivers_from_db(vehicle_type_id, limit)
+            drivers = await self._online_drivers_from_db(vehicle_type_id, limit)
+            logger.info(
+                "find_nearby_drivers_db_fallback",
+                source="database",
+                count=len(drivers),
+                vehicle_type_id=vehicle_type_id,
+            )
+            return drivers
 
         radius = radius_km or settings.driver_search_radius_km
         radius_m = radius * 1000
@@ -179,8 +211,19 @@ class DriverMatchingService:
                 count=limit * 2,
                 withdist=True,
             )
-        except Exception:
-            return await self._online_drivers_from_db(vehicle_type_id, limit)
+        except Exception as exc:
+            logger.warning(
+                "find_nearby_drivers_redis_geosearch_failed",
+                error=str(exc),
+            )
+            drivers = await self._online_drivers_from_db(vehicle_type_id, limit)
+            logger.info(
+                "find_nearby_drivers_db_fallback",
+                source="database",
+                count=len(drivers),
+                vehicle_type_id=vehicle_type_id,
+            )
+            return drivers
 
         drivers = []
         for driver_id, distance in results:
@@ -212,13 +255,32 @@ class DriverMatchingService:
                 break
 
         if not drivers:
-            return await self._online_drivers_from_db(vehicle_type_id, limit)
+            drivers = await self._online_drivers_from_db(vehicle_type_id, limit)
+            logger.info(
+                "find_nearby_drivers_db_fallback",
+                source="database",
+                count=len(drivers),
+                vehicle_type_id=vehicle_type_id,
+                reason="no_redis_geo_matches",
+            )
+        else:
+            logger.info(
+                "find_nearby_drivers_completed",
+                source="redis",
+                count=len(drivers),
+                vehicle_type_id=vehicle_type_id,
+            )
 
         return drivers
 
     async def send_ride_request(self, ride_id: UUID, driver_ids: List[str]) -> None:
         redis = await self._get_redis()
         if not redis:
+            logger.warning(
+                "ride_request_redis_skipped",
+                ride_id=str(ride_id),
+                driver_count=len(driver_ids),
+            )
             return
 
         try:
@@ -236,8 +298,19 @@ class DriverMatchingService:
                     f"{DRIVER_PENDING_PREFIX}{driver_id}",
                     settings.driver_request_timeout_seconds,
                 )
-        except Exception:
-            pass
+            logger.info(
+                "ride_request_sent_redis",
+                ride_id=str(ride_id),
+                driver_ids=driver_ids,
+                timeout_seconds=settings.driver_request_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.error(
+                "ride_request_redis_failed",
+                ride_id=str(ride_id),
+                driver_ids=driver_ids,
+                error=str(exc),
+            )
 
     async def get_pending_ride_ids(self, driver_id: UUID) -> List[UUID]:
         redis = await self._get_redis()
@@ -367,6 +440,15 @@ class DriverMatchingService:
         from app.notifications.service import NotificationService
         from sqlalchemy.orm import selectinload
 
+        logger.info(
+            "driver_dispatch_started",
+            ride_id=str(ride.id),
+            vehicle_type_id=str(ride.vehicle_type_id),
+            pickup_lat=ride.pickup_lat,
+            pickup_lng=ride.pickup_lng,
+            status=ride.status,
+        )
+
         result = await self.db.execute(
             select(Ride).options(selectinload(Ride.user)).where(Ride.id == ride.id)
         )
@@ -374,13 +456,30 @@ class DriverMatchingService:
 
         drivers = await self._online_drivers_for_ride(ride)
         if not drivers:
+            logger.warning(
+                "driver_dispatch_no_drivers",
+                ride_id=str(ride.id),
+                vehicle_type_id=str(ride.vehicle_type_id),
+                hint="Driver must be ONLINE, KYC APPROVED, and have matching vehicle type",
+            )
             return 0
 
         driver_ids = [str(driver.id) for driver in drivers]
+        logger.info(
+            "driver_dispatch_candidates",
+            ride_id=str(ride.id),
+            driver_count=len(drivers),
+            driver_ids=driver_ids,
+        )
         try:
             await self.send_ride_request(ride.id, driver_ids)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error(
+                "driver_dispatch_redis_enqueue_failed",
+                ride_id=str(ride.id),
+                driver_ids=driver_ids,
+                error=str(exc),
+            )
 
         passenger_name = (
             f"{ride.user.first_name} {ride.user.last_name}".strip()
@@ -428,6 +527,13 @@ class DriverMatchingService:
             if ws_manager:
                 await ws_manager.send_personal(str(driver.id), payload)
 
+        logger.info(
+            "driver_dispatch_completed",
+            ride_id=str(ride.id),
+            drivers_notified=len(drivers),
+            driver_ids=driver_ids,
+            websocket=ws_manager is not None,
+        )
         return len(drivers)
 
     async def ensure_driver_online(self, driver: Driver, lat: float, lng: float) -> None:
@@ -436,6 +542,13 @@ class DriverMatchingService:
         )
         vehicle = vehicle_result.scalar_one_or_none()
         vehicle_type_id = str(vehicle.vehicle_type_id) if vehicle else ""
+        logger.info(
+            "driver_going_online",
+            driver_id=str(driver.id),
+            lat=lat,
+            lng=lng,
+            vehicle_type_id=vehicle_type_id,
+        )
         await self.set_driver_online(driver.id, lat, lng, vehicle_type_id)
 
     async def driver_default_location(self, driver_id: UUID) -> tuple[float, float]:

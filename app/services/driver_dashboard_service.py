@@ -8,8 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.constants import RideStatus
 from app.drivers.models import Driver
-from app.models import Ride, RideEvent, WalletTransaction
-from app.services.payment_service import WalletService
+from app.models import Ride, RideEvent
+from app.services.driver_wallet_service import DriverWalletService
 
 
 def _start_of_period_utc(period: str) -> datetime | None:
@@ -41,14 +41,15 @@ class DriverDashboardService:
         return int(result.scalar_one() or 0)
 
     async def get_stats(self, driver: Driver) -> dict:
-        wallet = await WalletService(self.db).get_or_create_wallet(driver_id=driver.id)
+        wallet = await DriverWalletService(self.db).get_or_create(driver.id)
         today_start = _start_of_period_utc("daily")
 
         today_earnings_result = await self.db.execute(
-            select(func.coalesce(func.sum(WalletTransaction.amount), 0)).where(
-                WalletTransaction.wallet_id == wallet.id,
-                WalletTransaction.transaction_type == "CREDIT",
-                WalletTransaction.created_at >= today_start,
+            select(func.coalesce(func.sum(Ride.driver_earning), 0)).where(
+                Ride.driver_id == driver.id,
+                Ride.status == RideStatus.COMPLETED.value,
+                Ride.completed_at >= today_start,
+                Ride.driver_earning.isnot(None),
             )
         )
         today_earnings = float(today_earnings_result.scalar_one() or 0)
@@ -91,7 +92,7 @@ class DriverDashboardService:
 
         return {
             "today_earnings": today_earnings,
-            "wallet_balance": float(wallet.balance or 0),
+            "wallet_balance": float(wallet.available_balance or 0),
             "completed_trips": completed_trips,
             "today_trips": today_trips,
             "rating": round(float(driver.rating_avg or 0), 1),
@@ -99,18 +100,29 @@ class DriverDashboardService:
         }
 
     async def earnings_for_period(self, driver: Driver, period: str) -> dict:
-        wallet = await WalletService(self.db).get_or_create_wallet(driver_id=driver.id)
         period_start = _start_of_period_utc(period)
 
-        query = select(func.coalesce(func.sum(WalletTransaction.amount), 0)).where(
-            WalletTransaction.wallet_id == wallet.id,
-            WalletTransaction.transaction_type == "CREDIT",
+        earnings_query = select(func.coalesce(func.sum(Ride.driver_earning), 0)).where(
+            Ride.driver_id == driver.id,
+            Ride.status == RideStatus.COMPLETED.value,
+            Ride.driver_earning.isnot(None),
         )
         if period_start is not None:
-            query = query.where(WalletTransaction.created_at >= period_start)
+            earnings_query = earnings_query.where(Ride.completed_at >= period_start)
 
-        credit_sum = await self.db.execute(query)
-        period_earnings = float(credit_sum.scalar_one() or 0)
+        earnings_sum = await self.db.execute(earnings_query)
+        period_earnings = float(earnings_sum.scalar_one() or 0)
+
+        ride_query = select(Ride).where(
+            Ride.driver_id == driver.id,
+            Ride.status == RideStatus.COMPLETED.value,
+        )
+        if period_start is not None:
+            ride_query = ride_query.where(Ride.completed_at >= period_start)
+        ride_query = ride_query.order_by(Ride.completed_at.desc()).limit(50)
+
+        rides_result = await self.db.execute(ride_query)
+        rides = list(rides_result.scalars().all())
 
         completed_result = await self.db.execute(
             select(func.count())
@@ -118,11 +130,7 @@ class DriverDashboardService:
             .where(
                 Ride.driver_id == driver.id,
                 Ride.status == RideStatus.COMPLETED.value,
-                *(
-                    [Ride.completed_at >= period_start]
-                    if period_start is not None
-                    else []
-                ),
+                *([Ride.completed_at >= period_start] if period_start is not None else []),
             )
         )
         period_rides = int(completed_result.scalar_one() or 0)
@@ -132,4 +140,15 @@ class DriverDashboardService:
             "total_rides": period_rides,
             "total_earnings": period_earnings,
             "net_earnings": period_earnings,
+            "rides": [
+                {
+                    "ride_id": r.id,
+                    "ride_fare": float(r.final_fare or r.estimated_fare or 0),
+                    "driver_commission_percentage": float(r.driver_commission_percentage or 0),
+                    "driver_earning": float(r.driver_earning or 0),
+                    "ride_date": r.completed_at,
+                    "status": r.status,
+                }
+                for r in rides
+            ],
         }
