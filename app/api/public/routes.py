@@ -102,7 +102,7 @@ async def about(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(AppSetting).where(AppSetting.is_public == True))
     settings = {row.key: row.value for row in result.scalars().all()}
     return {
-        "app_name": settings.get("app_name", "Fast Bull"),
+        "app_name": settings.get("app_name", "Bull Wave Rides"),
         "description": settings.get("about", "Ride booking platform"),
         "contact_email": settings.get("contact_email", "support@ridebook.com"),
     }

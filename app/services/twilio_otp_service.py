@@ -32,6 +32,14 @@ class TwilioOtpService:
     def send_otp(self, phone: str) -> None:
         client = self._client_or_raise()
         try:
+            account = client.api.accounts(self.account_sid).fetch()
+            status = (account.status or "").lower()
+            logger.info("twilio_account_status", status=status)
+            if status in {"suspended", "closed", "inactive"}:
+                raise ValidationException(
+                    f"Twilio account is {status}. Subscription/billing may have ended — "
+                    "check Twilio Console > Billing and reactivate the account."
+                )
             verification = client.verify.v2.services(self.verify_service_sid).verifications.create(
                 to=phone,
                 channel="sms",

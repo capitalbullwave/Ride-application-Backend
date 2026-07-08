@@ -1,12 +1,14 @@
 """Unified authentication API — /api/v1/auth/*"""
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth.dependencies import get_current_user
 from app.api.auth.service import AuthApiService
+from app.auth.dependencies import security
 from app.core.constants import UserRole
 from app.core.exceptions import ValidationException
 from app.core.security import hash_password, verify_password
@@ -111,7 +113,38 @@ async def register(data: UnifiedRegisterRequest, db: AsyncSession = Depends(get_
 
 
 @router.post("/logout", response_model=MessageResponse)
-async def logout(user: Annotated[User, Depends(get_current_user)]):
+async def logout(
+    request: Request,
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)] = None,
+):
+    """Idempotent logout — never 401s; clients may call with expired/invalid tokens."""
+    from app.core.logging import get_logger
+    from app.core.security import decode_token
+
+    logger = get_logger(__name__)
+    has_auth_header = credentials is not None and bool(credentials.credentials)
+    user_id = None
+    role = None
+    token_valid = False
+
+    if has_auth_header:
+        try:
+            payload = decode_token(credentials.credentials)
+            user_id = payload.get("sub")
+            role = payload.get("role")
+            token_valid = payload.get("type") == "access"
+        except ValueError:
+            token_valid = False
+
+    logger.info(
+        "auth_logout",
+        has_authorization_header=has_auth_header,
+        token_valid=token_valid,
+        user_id=str(user_id) if user_id else None,
+        role=role,
+        client=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent", "")[:120],
+    )
     return MessageResponse(message="Logged out successfully")
 
 

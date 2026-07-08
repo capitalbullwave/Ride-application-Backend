@@ -1,9 +1,7 @@
 """Application configuration — single source of truth for all environment variables."""
-import os
 from functools import lru_cache
 from typing import List
 
-from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -50,14 +48,18 @@ class Settings(BaseSettings):
     aws_region: str = "us-east-1"
     upload_dir: str = "uploads"
 
-    # Firebase
-    firebase_credentials_path: str = "./firebase-credentials.json"
+    # Firebase (prefer Backend/app/serviceAccountKey.json in production)
+    firebase_credentials_path: str = "./app/serviceAccountKey.json"
 
     # Twilio (Verify API for SMS OTP)
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""
     twilio_phone_number: str = ""  # optional; Verify API does not require it
+    # OTP delivery: auto | twilio | local
+    # - auto/twilio: send real SMS via Twilio to the entered phone number
+    # - local: only for emergency offline testing (hardcoded 123456, no SMS)
+    otp_delivery_mode: str = "auto"
 
     # Email
     smtp_host: str = "smtp.gmail.com"
@@ -100,25 +102,6 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_json: bool = False
-
-    @field_validator("database_url", mode="before")
-    @classmethod
-    def normalize_database_url(cls, value: str) -> str:
-        """Accept Render/Heroku-style postgres:// and plain postgresql:// URLs."""
-        if not isinstance(value, str):
-            return value
-        if value.startswith("postgres://"):
-            value = "postgresql://" + value[len("postgres://") :]
-        if value.startswith("postgresql://") and "+" not in value.split("://", 1)[0]:
-            value = value.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return value
-
-    @model_validator(mode="after")
-    def derive_sync_database_url(self) -> "Settings":
-        if not os.getenv("DATABASE_SYNC_URL"):
-            sync_url = self.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
-            object.__setattr__(self, "database_sync_url", sync_url)
-        return self
 
     @property
     def cors_origins_list(self) -> List[str]:

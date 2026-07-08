@@ -86,23 +86,42 @@ class AuthService:
 
     _DEV_HARDCODED_OTP = "123456"
 
+    def _use_twilio_otp(self) -> bool:
+        """Decide whether OTP should go through Twilio Verify (real SMS)."""
+        mode = (settings.otp_delivery_mode or "auto").strip().lower()
+        twilio_ready = self._twilio_otp().is_configured
+
+        if mode == "local":
+            return False
+        if mode == "twilio":
+            if not twilio_ready:
+                raise ValidationException(
+                    "OTP_DELIVERY_MODE=twilio but Twilio credentials are missing in .env."
+                )
+            return True
+
+        # auto: always send real SMS when Twilio is configured (any environment)
+        return twilio_ready
+
     async def _issue_phone_otp(self, phone: str) -> str | None:
-        """Send OTP via Twilio Verify when configured; otherwise local/dev fallback."""
-        if self._twilio_otp().is_configured:
+        """Send OTP via Twilio Verify to the real phone number when configured."""
+        if self._use_twilio_otp():
             self._twilio_otp().send_otp(phone)
             return None
 
-        if settings.is_development:
+        if settings.is_development or not settings.is_production:
             logger.warning(
                 "dev_otp_hardcoded",
-                phone=phone,
+                phone=phone[-4:] if phone else "",
                 otp=self._DEV_HARDCODED_OTP,
-                hint="Twilio not configured — using hardcoded OTP 123456.",
+                mode=settings.otp_delivery_mode,
+                hint="Twilio not configured / OTP_DELIVERY_MODE=local — using 123456.",
             )
             return self._DEV_HARDCODED_OTP
 
-        otp = generate_otp()
-        return otp
+        raise ValidationException(
+            "SMS OTP is not configured. Add Twilio credentials or contact support."
+        )
 
     def _validate_phone_otp(
         self,
@@ -111,7 +130,7 @@ class AuthService:
         stored_otp: str | None,
         stored_expires_at: datetime | None,
     ) -> None:
-        if self._twilio_otp().is_configured:
+        if self._use_twilio_otp():
             self._twilio_otp().verify_otp(phone, submitted_otp)
             return
 

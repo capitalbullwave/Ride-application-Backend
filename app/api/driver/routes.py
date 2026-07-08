@@ -566,6 +566,10 @@ async def start_ride(
             "status": loaded.status,
         },
     )
+    try:
+        await NotificationService(db).notify_ride_started(loaded)
+    except Exception:
+        pass
     return _driver_active_ride_payload(loaded)
 
 
@@ -591,6 +595,10 @@ async def end_ride(
             "fare": ride.final_fare or ride.estimated_fare,
         },
     )
+    try:
+        await NotificationService(db).notify_ride_completed(ride)
+    except Exception:
+        pass
     payload = RideResponse.model_validate(ride).model_dump(mode="json")
     payload.update(_payment_breakdown_payload(ride))
     existing_payment = await PaymentService(db).get_ride_payment(ride.id)
@@ -988,7 +996,7 @@ async def driver_support_ticket_detail(
         messages.append(
             {
                 "id": str(reply.id),
-                "sender": "Fast Bull Support" if reply.sender_type == "ADMIN" else driver_name,
+                "sender": "Bull Wave Rides Support" if reply.sender_type == "ADMIN" else driver_name,
                 "sender_type": reply.sender_type.lower(),
                 "message": reply.message,
                 "created_at": reply.created_at.isoformat(),
@@ -1080,6 +1088,10 @@ async def arrived_ride(
     ride = await RideService(db).driver_arrived(data.ride_id, driver.id)
     await manager.broadcast_ride(str(data.ride_id), {"event": "driver_arrived", "ride_id": str(data.ride_id)})
     loaded = await _load_driver_ride(db, data.ride_id)
+    try:
+        await NotificationService(db).notify_driver_arrived(loaded)
+    except Exception:
+        pass
     return _driver_active_ride_payload(loaded)
 
 

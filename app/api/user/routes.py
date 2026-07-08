@@ -23,10 +23,10 @@ from app.schemas.ride import RideDetailResponse, RideResponse
 from app.services.driver_matching import DriverMatchingService
 from app.services.payment_service import WalletService
 from app.services.ride_service import RideService
-from app.services.user_benefits_service import (
-    get_user_ride_discount_percent,
-    map_student_pass,
-    map_subscription_plan,
+from app.services.promo_service import (
+    get_active_promo_codes,
+    resolve_promo_code,
+    serialize_user_coupon,
 )
 from app.services.subscription_payment_service import (
     SubscriptionPaymentService,
@@ -65,8 +65,14 @@ class BookRideRequest(BaseModel):
     dropoff_lng: float = 77.0266
     vehicle_category_id: str | None = None
     payment_method: str = "CASH"
+    promo_code: str | None = None
     rental_hours: float | None = Field(default=None, ge=0)
     scheduled_at: datetime | None = None
+
+
+class ValidateCouponRequest(BaseModel):
+    code: str = Field(..., min_length=2, max_length=50)
+    order_amount: float = Field(..., gt=0)
 
 
 class SupportRequest(BaseModel):
@@ -107,7 +113,7 @@ def _ticket_messages(ticket: SupportTicket, replies: list[SupportTicketReply], u
         messages.append(
             {
                 "id": str(reply.id),
-                "sender": "Fast Bull Support" if reply.sender_type == "ADMIN" else user_name,
+                "sender": "Bull Wave Rides Support" if reply.sender_type == "ADMIN" else user_name,
                 "sender_type": reply.sender_type.lower(),
                 "message": reply.message,
                 "created_at": reply.created_at.isoformat(),
@@ -362,6 +368,34 @@ async def saved_addresses(user: Annotated[User, Depends(get_current_user)], db: 
     return await _list_user_addresses(user, db)
 
 
+@router.get("/coupons")
+async def list_user_coupons(
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    promos = await get_active_promo_codes(db)
+    return [serialize_user_coupon(p) for p in promos]
+
+
+@router.post("/coupons/validate")
+async def validate_user_coupon(
+    data: ValidateCouponRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    promo, discount = await resolve_promo_code(
+        db,
+        data.code,
+        order_amount=data.order_amount,
+    )
+    return {
+        "valid": True,
+        "coupon": serialize_user_coupon(promo),
+        "discount_amount": discount,
+        "final_amount": round(max(0.0, data.order_amount - discount), 2),
+    }
+
+
 @router.post("/book-ride")
 async def book_ride(
     data: BookRideRequest,
@@ -386,6 +420,7 @@ async def book_ride(
         dropoff_lng=data.dropoff_lng,
         vehicle_type_id=vehicle_type_id,
         payment_method=data.payment_method,
+        promo_code=data.promo_code,
         rental_hours=data.rental_hours,
         scheduled_at=data.scheduled_at,
     )
@@ -513,6 +548,15 @@ async def cancel_ride(
                 "reason": data.reason or "Cancelled by passenger",
             },
         )
+    try:
+        await NotificationService(db).notify_ride_cancelled(
+            ride,
+            reason=data.reason or "Cancelled by passenger",
+            notify_user=False,
+            notify_driver=True,
+        )
+    except Exception:
+        pass
     return RideResponse.model_validate(ride)
 
 

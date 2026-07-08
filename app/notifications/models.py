@@ -31,6 +31,8 @@ class Notification(UUIDMixin, TimestampMixin, Base):
     data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     is_read: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     read_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
     user: Mapped[Optional["User"]] = relationship("User", back_populates="notifications")
     driver: Mapped[Optional["Driver"]] = relationship("Driver", back_populates="notifications")

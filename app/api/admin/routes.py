@@ -98,15 +98,29 @@ async def send_notification(
     admin: Annotated[AdminUser, Depends(get_current_admin)],
     db: AsyncSession = Depends(get_db),
 ):
-    notification = Notification(
-        title=data.title,
-        message=data.message,
-        notification_type="ADMIN_BROADCAST",
-        is_read=False,
+    from app.notifications.schemas import AdminBroadcastRequest
+    from app.notifications.router import admin_broadcast
+
+    # Prefer the production FCM broadcast path while keeping this admin alias.
+    result = await admin_broadcast(
+        AdminBroadcastRequest(
+            title=data.title,
+            body=data.message,
+            target=data.target if data.target in {
+                "all_users",
+                "all_drivers",
+                "city",
+                "user",
+                "driver",
+                "promotion",
+                "news",
+                "maintenance",
+            } else "all_users",
+        ),
+        admin,
+        db,
     )
-    db.add(notification)
-    await db.flush()
-    return {"id": str(notification.id), "title": data.title, "message": data.message, "target": data.target}
+    return {"title": data.title, "message": data.message, "target": data.target, **result}
 
 
 @router.put("/pricing")

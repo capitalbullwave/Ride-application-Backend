@@ -41,6 +41,9 @@ ALLOWED_PREFIXES = (
     f"{settings.api_v1_prefix}/auth",
     f"{settings.api_v1_prefix}/user",
     f"{settings.api_v1_prefix}/driver",
+    f"{settings.api_v1_prefix}/users",
+    f"{settings.api_v1_prefix}/drivers",
+    f"{settings.api_v1_prefix}/notifications",
     f"{settings.api_v1_prefix}/admin",
     f"{settings.api_v1_prefix}/common",
     f"{settings.api_v1_prefix}/public",
@@ -52,6 +55,12 @@ ALLOWED_PREFIXES = (
 async def lifespan(app: FastAPI):
     app.openapi_schema = None
     logger.info("application_starting", env=settings.app_env, version="2.0.0")
+    try:
+        from app.core.firebase import initialize_firebase
+
+        initialize_firebase()
+    except Exception as exc:
+        logger.warning("firebase_startup_skipped", error=str(exc))
     yield
     await close_redis()
     logger.info("application_stopped")
@@ -76,11 +85,10 @@ def create_app() -> FastAPI:
         "allow_credentials": True,
         "allow_methods": ["*"],
         "allow_headers": ["*"],
+        # Flutter web dev servers use random localhost ports — always allow them.
+        "allow_origin_regex": r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     }
-    if settings.is_development:
-        # Flutter web, Vite, and other local dev servers use random localhost ports.
-        cors_kwargs["allow_origin_regex"] = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
-    else:
+    if not settings.is_development:
         cors_kwargs["allow_origins"] = settings.cors_origins_list
 
     application.add_middleware(CORSMiddleware, **cors_kwargs)

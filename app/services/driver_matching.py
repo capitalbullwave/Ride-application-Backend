@@ -517,12 +517,11 @@ class DriverMatchingService:
         )
 
         for driver in drivers:
-            await notif_service.create_in_app(
-                title="New ride request",
-                message=message,
-                notification_type="RIDE",
-                driver_id=driver.id,
-                data=payload,
+            await notif_service.notify_driver_new_ride_request(
+                driver.id,
+                "New ride request",
+                message,
+                payload,
             )
             if ws_manager:
                 await ws_manager.send_personal(str(driver.id), payload)

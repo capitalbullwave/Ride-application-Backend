@@ -1,6 +1,7 @@
 """Student pass and subscription migration."""
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 from sqlalchemy.dialects.postgresql import UUID
 import json
 
@@ -58,58 +59,70 @@ DEFAULT_PLANS = [
 
 
 def upgrade() -> None:
-    op.create_table(
-        "subscription_plans",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True),
-        sa.Column("slug", sa.String(50), nullable=False),
-        sa.Column("name", sa.String(100), nullable=False),
-        sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("price", sa.Float(), nullable=False, server_default="0"),
-        sa.Column("period_label", sa.String(30), nullable=False, server_default="month"),
-        sa.Column("benefits_json", sa.Text(), nullable=True),
-        sa.Column("ride_discount_percent", sa.Float(), nullable=False, server_default="0"),
-        sa.Column("is_popular", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
-        sa.Column("sort_order", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("slug", name="uq_subscription_plans_slug"),
-    )
-    op.create_index("ix_subscription_plans_slug", "subscription_plans", ["slug"])
+    bind = op.get_bind()
+    tables = set(inspect(bind).get_table_names())
 
-    op.create_table(
-        "user_subscriptions",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True),
-        sa.Column("user_id", UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("plan_id", UUID(as_uuid=True), sa.ForeignKey("subscription_plans.id", ondelete="RESTRICT"), nullable=False),
-        sa.Column("status", sa.String(20), nullable=False, server_default="ACTIVE"),
-        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("user_id", name="uq_user_subscriptions_user_id"),
-    )
-    op.create_index("ix_user_subscriptions_user_id", "user_subscriptions", ["user_id"])
+    if "subscription_plans" not in tables:
+        op.create_table(
+            "subscription_plans",
+            sa.Column("id", UUID(as_uuid=True), primary_key=True),
+            sa.Column("slug", sa.String(50), nullable=False),
+            sa.Column("name", sa.String(100), nullable=False),
+            sa.Column("description", sa.Text(), nullable=True),
+            sa.Column("price", sa.Float(), nullable=False, server_default="0"),
+            sa.Column("period_label", sa.String(30), nullable=False, server_default="month"),
+            sa.Column("benefits_json", sa.Text(), nullable=True),
+            sa.Column("ride_discount_percent", sa.Float(), nullable=False, server_default="0"),
+            sa.Column("is_popular", sa.Boolean(), nullable=False, server_default=sa.false()),
+            sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+            sa.Column("sort_order", sa.Integer(), nullable=False, server_default="0"),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.UniqueConstraint("slug", name="uq_subscription_plans_slug"),
+        )
+        op.create_index("ix_subscription_plans_slug", "subscription_plans", ["slug"])
 
-    op.create_table(
-        "student_passes",
-        sa.Column("id", UUID(as_uuid=True), primary_key=True),
-        sa.Column("user_id", UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("aadhar_number", sa.String(12), nullable=False),
-        sa.Column("college_name", sa.String(200), nullable=False),
-        sa.Column("aadhar_photo_url", sa.String(500), nullable=True),
-        sa.Column("student_id_photo_url", sa.String(500), nullable=True),
-        sa.Column("status", sa.String(20), nullable=False, server_default="PENDING"),
-        sa.Column("discount_percent", sa.Float(), nullable=False, server_default="20"),
-        sa.Column("rejection_reason", sa.Text(), nullable=True),
-        sa.Column("verified_by_id", UUID(as_uuid=True), sa.ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True),
-        sa.Column("verified_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("user_id", name="uq_student_passes_user_id"),
-    )
-    op.create_index("ix_student_passes_user_id", "student_passes", ["user_id"])
-    op.create_index("ix_student_passes_status", "student_passes", ["status"])
+    if "user_subscriptions" not in tables:
+        op.create_table(
+            "user_subscriptions",
+            sa.Column("id", UUID(as_uuid=True), primary_key=True),
+            sa.Column("user_id", UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+            sa.Column("plan_id", UUID(as_uuid=True), sa.ForeignKey("subscription_plans.id", ondelete="RESTRICT"), nullable=False),
+            sa.Column("status", sa.String(20), nullable=False, server_default="ACTIVE"),
+            sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+            sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.UniqueConstraint("user_id", name="uq_user_subscriptions_user_id"),
+        )
+        op.create_index("ix_user_subscriptions_user_id", "user_subscriptions", ["user_id"])
+
+    if "student_passes" not in tables:
+        op.create_table(
+            "student_passes",
+            sa.Column("id", UUID(as_uuid=True), primary_key=True),
+            sa.Column("user_id", UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+            sa.Column("aadhar_number", sa.String(12), nullable=False),
+            sa.Column("college_name", sa.String(200), nullable=False),
+            sa.Column("aadhar_photo_url", sa.String(500), nullable=True),
+            sa.Column("student_id_photo_url", sa.String(500), nullable=True),
+            sa.Column("status", sa.String(20), nullable=False, server_default="PENDING"),
+            sa.Column("discount_percent", sa.Float(), nullable=False, server_default="20"),
+            sa.Column("rejection_reason", sa.Text(), nullable=True),
+            sa.Column("verified_by_id", UUID(as_uuid=True), sa.ForeignKey("admin_users.id", ondelete="SET NULL"), nullable=True),
+            sa.Column("verified_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+            sa.UniqueConstraint("user_id", name="uq_student_passes_user_id"),
+        )
+        op.create_index("ix_student_passes_user_id", "student_passes", ["user_id"])
+        op.create_index("ix_student_passes_status", "student_passes", ["status"])
+
+    plan_count = bind.execute(sa.text("SELECT COUNT(*) FROM subscription_plans")).scalar()
+    if plan_count:
+        return
+
+    import uuid
 
     plans_table = sa.table(
         "subscription_plans",
@@ -125,8 +138,6 @@ def upgrade() -> None:
         sa.column("is_active", sa.Boolean),
         sa.column("sort_order", sa.Integer),
     )
-
-    import uuid
 
     rows = []
     for plan in DEFAULT_PLANS:

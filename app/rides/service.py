@@ -257,6 +257,23 @@ class RideService:
         if discount_pct > 0:
             fare = apply_member_discount_to_fare(fare, discount_pct)
 
+        promo_discount = 0.0
+        promo_code_id = None
+        if data.promo_code:
+            from app.services.promo_service import resolve_promo_code
+
+            promo, promo_discount = await resolve_promo_code(
+                self.db,
+                data.promo_code,
+                order_amount=float(fare["estimated_fare"]),
+            )
+            promo_code_id = promo.id
+            fare["estimated_fare"] = round(
+                max(0.0, float(fare["estimated_fare"]) - promo_discount),
+                2,
+            )
+            fare["promo_discount"] = promo_discount
+
         # Rental bookings are hour-based; don't block on external routing.
         if (vehicle_type.service_group or "ride") != "rental":
             await self.maps.get_route_between(data.pickup_address, data.dropoff_address)
@@ -282,11 +299,18 @@ class RideService:
             tax_amount=fare["tax_amount"],
             platform_fee=fare["platform_fee"],
             promo_discount=fare.get("promo_discount", 0),
+            promo_code_id=promo_code_id,
             payment_method=data.payment_method,
             ride_otp=generate_otp(4),
             scheduled_at=data.scheduled_at,
         )
         ride = await self.crud.create(ride)
+        if promo_code_id is not None:
+            from app.coupons.models import PromoCode
+
+            promo_row = await self.db.get(PromoCode, promo_code_id)
+            if promo_row is not None:
+                promo_row.used_count = int(promo_row.used_count or 0) + 1
         await self.crud.add_event(
             ride_id=ride.id,
             event_type=RideEventType.REQUESTED.value,

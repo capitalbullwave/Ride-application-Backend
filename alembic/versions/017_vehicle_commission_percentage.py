@@ -6,9 +6,15 @@ depends_on = None
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    cols = {c["name"] for c in inspect(bind).get_columns("vehicle_types")}
+    if "driver_commission_percentage" in cols:
+        return
+
     op.add_column(
         "vehicle_types",
         sa.Column("driver_commission_percentage", sa.Float(), nullable=True),

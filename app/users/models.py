@@ -40,6 +40,9 @@ class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     emergency_contact_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     emergency_contact_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     fcm_token: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    device_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    device_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_login_device: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True, index=True)
     referred_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(

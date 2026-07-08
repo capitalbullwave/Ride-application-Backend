@@ -160,6 +160,27 @@ class WalletPaymentService:
         await self.db.refresh(wallet)
         await self.db.refresh(txn)
 
+        try:
+            from app.notifications.service import NotificationService
+
+            amount = float(payment.amount)
+            await NotificationService(self.db).notify_and_push(
+                title="Wallet Credited",
+                message=f"₹{amount:.0f} has been added to your wallet.",
+                notification_type="WALLET",
+                user_id=user.id,
+                event="wallet_credit",
+                data={
+                    "amount": amount,
+                    "balance": float(wallet.balance),
+                    "screen": "wallet",
+                },
+                channel_id="wallet",
+            )
+            await self.db.commit()
+        except Exception:
+            pass
+
         return {
             "balance": wallet.balance,
             "transaction": {

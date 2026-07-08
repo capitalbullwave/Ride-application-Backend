@@ -1,7 +1,9 @@
-# Environment & secrets
+# Environment / secrets
 .env
-.env.*
+.env.local
+.env.*.local
 !.env.example
+serviceAccountKey.json
 firebase-credentials.json
 *.pem
 *.key
@@ -12,32 +14,19 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-venv/
 .venv/
+venv/
 env/
-ENV/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
 
-# Testing & coverage
+# Testing / type checking
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
@@ -45,43 +34,27 @@ htmlcov/
 .nox/
 coverage.xml
 *.cover
-*.py,cover
-.hypothesis/
-
-# Linting & type checking
-.ruff_cache/
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
 # Logs
 *.log
 logs/
 
-# Local uploads (user-generated content)
-uploads/*
-!uploads/.gitkeep
+# Runtime uploads (user/driver documents, vehicle icons)
+uploads/
 
 # Celery
 celerybeat-schedule
 celerybeat.pid
 
-# Database
+# Local databases / sqlite
 *.db
 *.sqlite3
 
-# IDE & editors
-.vscode/
+# IDE / OS
 .idea/
+.vscode/
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~
-
-# OS
-.DS_Store
-Thumbs.db
-Desktop.ini
-
-# Docker
-docker/
-docker-compose.override.yml

@@ -30,6 +30,7 @@ class UserApiService:
                     "included_distance_km": vt.included_distance_km,
                     "icon_url": vt.icon,
                     "service_group": vt.service_group or "ride",
+                    "capacity": vt.capacity,
                 }
                 for vt in vehicle_types
             ],
@@ -46,6 +47,7 @@ class UserApiService:
                     "per_hour_rate": vt.per_hour_rate,
                     "icon_url": vt.icon,
                     "service_group": "rental",
+                    "capacity": vt.capacity,
                 }
                 for vt in vehicle_types
                 if (vt.service_group or "ride") == "rental"

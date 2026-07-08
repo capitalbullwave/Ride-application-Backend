@@ -48,7 +48,7 @@ DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 DEFAULT_SETTINGS = {
-    "appName": "Fast Bull",
+    "appName": "Bull Wave Rides",
     "logo": "",
     "contactEmail": "support@ridebook.com",
     "contactPhone": "+91 98765 43210",
@@ -214,7 +214,7 @@ def _map_support_ticket(
         messages.append(
             {
                 "id": str(reply.id),
-                "sender": "Fast Bull Support" if reply.sender_type == "ADMIN" else user_name,
+                "sender": "Bull Wave Rides Support" if reply.sender_type == "ADMIN" else user_name,
                 "senderType": reply.sender_type.lower(),
                 "message": reply.message,
                 "timestamp": reply.created_at.isoformat(),
@@ -868,14 +868,45 @@ async def update_coupon(
     promo = await db.get(PromoCode, coupon_id)
     if not promo:
         raise NotFoundException("Coupon not found")
+    if "code" in data and data["code"]:
+        promo.code = str(data["code"]).upper()
+    if "discountType" in data:
+        promo.discount_type = (
+            "PERCENTAGE" if data["discountType"] == "percentage" else "FIXED"
+        )
     if "status" in data:
         promo.is_active = data["status"] == "active"
     if "discountValue" in data:
         promo.discount_value = float(data["discountValue"])
+    if "maxDiscount" in data:
+        promo.max_discount = float(data["maxDiscount"])
     if "usageLimit" in data:
         promo.max_uses = int(data["usageLimit"])
+    if "expiryDate" in data and data["expiryDate"]:
+        expiry = datetime.fromisoformat(str(data["expiryDate"]))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        promo.valid_until = expiry
     await db.flush()
     return _map_coupon(promo)
+
+
+@router.delete("/coupons/{coupon_id}")
+async def delete_coupon(
+    coupon_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    promo = await db.get(PromoCode, coupon_id)
+    if not promo:
+        raise NotFoundException("Coupon not found")
+    if int(promo.used_count or 0) > 0:
+        promo.is_active = False
+        await db.flush()
+        return {"success": True, "deactivated": True}
+    await db.delete(promo)
+    await db.flush()
+    return {"success": True, "deactivated": False}
 
 
 @router.get("/support/tickets")

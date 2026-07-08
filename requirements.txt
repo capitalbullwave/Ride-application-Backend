@@ -1,5 +1,4 @@
 # Core
-setuptools>=75.0.0
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-multipart==0.0.20
@@ -45,7 +44,7 @@ boto3==1.35.86
 
 # Payments
 stripe==11.4.0
-razorpay>=1.4.3
+razorpay==1.4.2
 
 # WebSocket
 websockets==14.1

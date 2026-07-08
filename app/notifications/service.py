@@ -1,13 +1,19 @@
-"""Notification service - Push, Email, SMS, In-App."""
+"""Notification service - Push, In-App, FCM, ride lifecycle."""
+from __future__ import annotations
+
 from datetime import datetime, timezone
-from uuid import UUID
+from typing import Any
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import NotFoundException
-from app.models import Notification
-from app.tasks.celery_app import send_notification
+from app.core.logging import get_logger
+from app.models import Driver, Notification, User
+from app.services import firebase_notification_service as fcm
+
+logger = get_logger(__name__)
 
 _DRIVER_TYPE_MAP = {
     "RIDE": "ride",
@@ -17,11 +23,37 @@ _DRIVER_TYPE_MAP = {
     "ADMIN": "system",
     "ADMIN_BROADCAST": "system",
     "CHAT": "system",
+    "WALLET": "bonus",
+}
+
+_EVENT_SCREEN_MAP = {
+    "ride_request": "ride_request",
+    "ride_accepted": "live_tracking",
+    "driver_arrived": "live_tracking",
+    "ride_started": "live_tracking",
+    "ride_completed": "ride_summary",
+    "ride_cancelled": "home",
+    "wallet_credit": "wallet",
+    "wallet_debit": "wallet",
+    "payment_success": "wallet",
+    "promotion": "offers",
+    "subscription": "subscription",
+    "admin_announcement": "notifications",
+}
+
+_CHANNEL_BY_TYPE = {
+    "RIDE": "ride",
+    "WALLET": "wallet",
+    "PAYMENT": "wallet",
+    "PROMO": "promotion",
+    "ADMIN": "admin",
+    "ADMIN_BROADCAST": "admin",
+    "SYSTEM": "admin",
 }
 
 
 def _utc_now_naive() -> datetime:
-    """notifications.read_at is TIMESTAMP WITHOUT TIME ZONE."""
+    """notifications.read_at / sent_at are TIMESTAMP WITHOUT TIME ZONE."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -38,12 +70,63 @@ def serialize_driver_notification(notification: Notification) -> dict:
         "read": notification.is_read,
         "created_at": notification.created_at.isoformat(),
         "data": notification.data,
+        "status": getattr(notification, "status", None),
+    }
+
+
+def serialize_user_notification(notification: Notification) -> dict:
+    data = notification.data or {}
+    return {
+        "id": str(notification.id),
+        "title": notification.title,
+        "message": notification.message,
+        "body": notification.message,
+        "type": notification.notification_type,
+        "read": notification.is_read,
+        "is_read": notification.is_read,
+        "time": notification.created_at.isoformat() if notification.created_at else None,
+        "created_at": notification.created_at.isoformat() if notification.created_at else None,
+        "data": data,
+        "status": getattr(notification, "status", None),
     }
 
 
 class NotificationService:
     def __init__(self, db: AsyncSession):
         self.db = db
+
+    def _enrich_data(
+        self,
+        data: dict | None,
+        *,
+        notification_type: str,
+        event: str | None = None,
+        user_id: UUID | None = None,
+        driver_id: UUID | None = None,
+        ride_id: str | None = None,
+        booking_id: str | None = None,
+        screen: str | None = None,
+        priority: str = "high",
+    ) -> dict[str, Any]:
+        payload = dict(data or {})
+        evt = event or payload.get("event") or notification_type.lower()
+        payload.setdefault("type", evt)
+        payload.setdefault("event", evt)
+        payload.setdefault("notification_id", str(uuid4()))
+        payload.setdefault("timestamp", str(int(datetime.now(timezone.utc).timestamp())))
+        payload.setdefault("priority", priority)
+        payload.setdefault("screen", screen or _EVENT_SCREEN_MAP.get(str(evt), "notifications"))
+        if user_id:
+            payload.setdefault("user_id", str(user_id))
+        if driver_id:
+            payload.setdefault("driver_id", str(driver_id))
+        if ride_id:
+            payload.setdefault("ride_id", str(ride_id))
+        if booking_id:
+            payload.setdefault("booking_id", str(booking_id))
+        elif ride_id:
+            payload.setdefault("booking_id", str(ride_id))
+        return payload
 
     async def create_in_app(
         self,
@@ -53,6 +136,8 @@ class NotificationService:
         user_id: UUID | None = None,
         driver_id: UUID | None = None,
         data: dict | None = None,
+        *,
+        status: str = "pending",
     ) -> Notification:
         notification = Notification(
             user_id=user_id,
@@ -61,16 +146,174 @@ class NotificationService:
             message=message,
             notification_type=notification_type,
             data=data,
+            status=status,
         )
         self.db.add(notification)
         await self.db.flush()
         await self.db.refresh(notification)
         return notification
 
-    async def send_push(self, user_id: str, title: str, message: str, data: dict | None = None):
-        send_notification.delay(user_id, title, message, data)
+    async def _clear_invalid_token(self, *, user_id: UUID | None = None, driver_id: UUID | None = None) -> None:
+        if user_id:
+            user = await self.db.get(User, user_id)
+            if user:
+                logger.warning("fcm_token_cleared_invalid", user_id=str(user_id))
+                user.fcm_token = None
+        if driver_id:
+            driver = await self.db.get(Driver, driver_id)
+            if driver:
+                logger.warning("fcm_token_cleared_invalid", driver_id=str(driver_id))
+                driver.fcm_token = None
+        await self.db.flush()
 
-    async def send_ride_notification(self, ride_id: str, event: str, user_id: UUID, driver_id: UUID | None = None):
+    async def _mark_delivery(self, notification: Notification | None, result: dict) -> None:
+        if notification is None:
+            return
+        if result.get("success"):
+            notification.status = "sent"
+            notification.sent_at = _utc_now_naive()
+        elif result.get("invalid_token"):
+            notification.status = "failed_invalid_token"
+        else:
+            notification.status = "failed"
+        await self.db.flush()
+
+    async def send_push(
+        self,
+        user_id: str,
+        title: str,
+        message: str,
+        data: dict | None = None,
+        *,
+        channel_id: str | None = None,
+        notification: Notification | None = None,
+    ) -> dict:
+        """Send FCM to a user. Falls back to Celery enqueue when direct send is unavailable."""
+        uid = UUID(str(user_id)) if user_id else None
+        token = None
+        if uid:
+            user = await self.db.get(User, uid)
+            token = user.fcm_token if user else None
+
+        if not token:
+            logger.info("fcm_push_skipped_no_token", user_id=str(user_id))
+            if notification:
+                notification.status = "skipped_no_token"
+                await self.db.flush()
+            return {"success": False, "error": "no_token"}
+
+        result = fcm.send_to_token(
+            token,
+            title,
+            message,
+            data,
+            channel_id=channel_id or "ride",
+            analytics_label=(data or {}).get("event"),
+        )
+        await self._mark_delivery(notification, result)
+        if result.get("invalid_token") and uid:
+            await self._clear_invalid_token(user_id=uid)
+
+        # Best-effort Celery enqueue for workers that may also process notifications.
+        try:
+            from app.tasks.celery_app import send_notification as celery_send
+
+            celery_send.delay(str(user_id), title, message, data)
+        except Exception:
+            pass
+
+        return result
+
+    async def send_push_to_driver(
+        self,
+        driver_id: str | UUID,
+        title: str,
+        message: str,
+        data: dict | None = None,
+        *,
+        channel_id: str | None = None,
+        notification: Notification | None = None,
+    ) -> dict:
+        did = UUID(str(driver_id))
+        driver = await self.db.get(Driver, did)
+        token = driver.fcm_token if driver else None
+        if not token:
+            logger.info("fcm_push_skipped_no_token", driver_id=str(driver_id))
+            if notification:
+                notification.status = "skipped_no_token"
+                await self.db.flush()
+            return {"success": False, "error": "no_token"}
+
+        result = fcm.send_to_token(
+            token,
+            title,
+            message,
+            data,
+            channel_id=channel_id or "ride",
+            analytics_label=(data or {}).get("event"),
+        )
+        await self._mark_delivery(notification, result)
+        if result.get("invalid_token"):
+            await self._clear_invalid_token(driver_id=did)
+        return result
+
+    async def notify_and_push(
+        self,
+        *,
+        title: str,
+        message: str,
+        notification_type: str = "SYSTEM",
+        user_id: UUID | None = None,
+        driver_id: UUID | None = None,
+        data: dict | None = None,
+        event: str | None = None,
+        ride_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> Notification:
+        payload = self._enrich_data(
+            data,
+            notification_type=notification_type,
+            event=event,
+            user_id=user_id,
+            driver_id=driver_id,
+            ride_id=ride_id,
+        )
+        notification = await self.create_in_app(
+            title=title,
+            message=message,
+            notification_type=notification_type,
+            user_id=user_id,
+            driver_id=driver_id,
+            data=payload,
+        )
+        channel = channel_id or _CHANNEL_BY_TYPE.get(notification_type.upper(), "admin")
+        if user_id:
+            await self.send_push(
+                str(user_id),
+                title,
+                message,
+                payload,
+                channel_id=channel,
+                notification=notification,
+            )
+        if driver_id:
+            await self.send_push_to_driver(
+                driver_id,
+                title,
+                message,
+                payload,
+                channel_id=channel,
+                notification=notification,
+            )
+        return notification
+
+    async def send_ride_notification(
+        self,
+        ride_id: str,
+        event: str,
+        user_id: UUID,
+        driver_id: UUID | None = None,
+    ):
         messages = {
             "ride_accepted": ("Ride Accepted", "Your driver is on the way!"),
             "driver_arrived": ("Driver Arrived", "Your driver has arrived at pickup location"),
@@ -79,15 +322,19 @@ class NotificationService:
             "ride_cancelled": ("Ride Cancelled", "Your ride has been cancelled."),
         }
         title, message = messages.get(event, ("Ride Update", f"Ride status: {event}"))
-        await self.create_in_app(title, message, "RIDE", user_id=user_id, data={"ride_id": ride_id, "event": event})
-        await self.send_push(str(user_id), title, message, {"ride_id": ride_id})
+        await self.notify_and_push(
+            title=title,
+            message=message,
+            notification_type="RIDE",
+            user_id=user_id,
+            driver_id=None,
+            event=event,
+            ride_id=ride_id,
+            data={"ride_id": ride_id, "event": event, "driver_id": str(driver_id) if driver_id else None},
+            channel_id="ride",
+        )
 
-    async def notify_user_ride_accepted(
-        self,
-        ride,
-        driver,
-        vehicle=None,
-    ) -> Notification:
+    async def notify_user_ride_accepted(self, ride, driver, vehicle=None) -> Notification:
         from app.utils.phone import format_phone_display
 
         driver_name = f"{driver.first_name} {driver.last_name}".strip() or "Driver"
@@ -115,6 +362,7 @@ class NotificationService:
             "dropoff_address": ride.dropoff_address,
             "estimated_fare": fare,
             "status": ride.status,
+            "screen": "live_tracking",
         }
         if ride.vehicle_type:
             data["vehicle_type"] = {
@@ -124,20 +372,176 @@ class NotificationService:
             }
             data["vehicle_type_slug"] = ride.vehicle_type.slug
             data["vehicle_type_name"] = ride.vehicle_type.name
-        notification = await self.create_in_app(
+
+        return await self.notify_and_push(
             title="Ride accepted!",
             message=message,
             notification_type="RIDE",
             user_id=ride.user_id,
+            event="ride_accepted",
+            ride_id=str(ride.id),
             data=data,
+            channel_id="ride",
         )
-        await self.send_push(
-            str(ride.user_id),
-            "Ride accepted!",
-            f"{driver_name} is coming in {vehicle_number}. Start code: {start_code}",
-            data,
+
+    async def notify_driver_arrived(self, ride) -> Notification:
+        return await self.notify_and_push(
+            title="Driver Arrived",
+            message="Your driver has arrived at the pickup location.",
+            notification_type="RIDE",
+            user_id=ride.user_id,
+            event="driver_arrived",
+            ride_id=str(ride.id),
+            data={"status": ride.status},
+            channel_id="ride",
         )
-        return notification
+
+    async def notify_ride_started(self, ride) -> Notification:
+        return await self.notify_and_push(
+            title="Ride Started",
+            message="Your ride has started. Enjoy your trip!",
+            notification_type="RIDE",
+            user_id=ride.user_id,
+            event="ride_started",
+            ride_id=str(ride.id),
+            data={"status": ride.status},
+            channel_id="ride",
+        )
+
+    async def notify_ride_completed(self, ride) -> Notification:
+        fare = float(getattr(ride, "final_fare", None) or ride.estimated_fare or 0)
+        return await self.notify_and_push(
+            title="Ride Completed",
+            message=f"Your ride is complete. Fare: ₹{fare:.0f}. Please rate your driver.",
+            notification_type="RIDE",
+            user_id=ride.user_id,
+            event="ride_completed",
+            ride_id=str(ride.id),
+            data={"status": ride.status, "fare": fare},
+            channel_id="ride",
+        )
+
+    async def notify_ride_cancelled(
+        self,
+        ride,
+        *,
+        reason: str = "Ride cancelled",
+        notify_user: bool = True,
+        notify_driver: bool = True,
+    ) -> None:
+        if notify_user and ride.user_id:
+            await self.notify_and_push(
+                title="Ride Cancelled",
+                message=reason,
+                notification_type="RIDE",
+                user_id=ride.user_id,
+                event="ride_cancelled",
+                ride_id=str(ride.id),
+                data={"reason": reason, "status": getattr(ride, "status", None)},
+                channel_id="ride",
+            )
+        if notify_driver and ride.driver_id:
+            await self.notify_and_push(
+                title="Ride Cancelled",
+                message=reason,
+                notification_type="RIDE",
+                driver_id=ride.driver_id,
+                event="ride_cancelled",
+                ride_id=str(ride.id),
+                data={"reason": reason, "status": getattr(ride, "status", None)},
+                channel_id="ride",
+            )
+
+    async def notify_driver_new_ride_request(
+        self,
+        driver_id: UUID,
+        title: str,
+        message: str,
+        data: dict,
+    ) -> Notification:
+        return await self.notify_and_push(
+            title=title,
+            message=message,
+            notification_type="RIDE",
+            driver_id=driver_id,
+            event="ride_request",
+            ride_id=str(data.get("ride_id")) if data.get("ride_id") else None,
+            data=data,
+            channel_id="ride",
+        )
+
+    async def update_user_device_token(
+        self,
+        user: User,
+        *,
+        fcm_token: str,
+        device_type: str = "android",
+        device_id: str | None = None,
+    ) -> list[str]:
+        # Token uniqueness: clear from other users/drivers holding the same token
+        await self.db.execute(
+            update(User).where(User.fcm_token == fcm_token, User.id != user.id).values(fcm_token=None)
+        )
+        await self.db.execute(
+            update(Driver).where(Driver.fcm_token == fcm_token).values(fcm_token=None)
+        )
+        user.fcm_token = fcm_token
+        user.device_type = device_type
+        if device_id:
+            user.device_id = device_id
+            user.last_login_device = device_id
+        await self.db.flush()
+
+        topics = [fcm.TOPIC_ALL_USERS, fcm.TOPIC_PROMOTION, fcm.TOPIC_NEWS]
+        for topic in topics:
+            fcm.subscribe_token(fcm_token, topic)
+        return topics
+
+    async def update_driver_device_token(
+        self,
+        driver: Driver,
+        *,
+        fcm_token: str,
+        device_type: str = "android",
+        device_id: str | None = None,
+    ) -> list[str]:
+        await self.db.execute(
+            update(Driver).where(Driver.fcm_token == fcm_token, Driver.id != driver.id).values(fcm_token=None)
+        )
+        await self.db.execute(
+            update(User).where(User.fcm_token == fcm_token).values(fcm_token=None)
+        )
+        driver.fcm_token = fcm_token
+        driver.device_type = device_type
+        if device_id:
+            driver.device_id = device_id
+            driver.last_login_device = device_id
+        await self.db.flush()
+
+        topics = [fcm.TOPIC_ALL_DRIVERS, fcm.TOPIC_PROMOTION, fcm.TOPIC_NEWS]
+        for topic in topics:
+            fcm.subscribe_token(fcm_token, topic)
+        return topics
+
+    async def list_for_user(
+        self,
+        user_id: UUID,
+        page: int = 1,
+        page_size: int = 20,
+        unread_only: bool = False,
+    ) -> tuple[list[Notification], int]:
+        filters = [Notification.user_id == user_id]
+        if unread_only:
+            filters.append(Notification.is_read.is_(False))
+        base = select(Notification).where(*filters)
+        total_result = await self.db.execute(select(func.count()).select_from(base.subquery()))
+        total = int(total_result.scalar_one())
+        result = await self.db.execute(
+            base.order_by(Notification.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        return list(result.scalars().all()), total
 
     async def list_for_driver(
         self,
@@ -187,6 +591,52 @@ class NotificationService:
         )
         await self.db.flush()
         return int(result.rowcount or 0)
+
+    async def mark_user_notification_read(self, notification_id: UUID, user_id: UUID) -> Notification:
+        result = await self.db.execute(
+            select(Notification).where(
+                Notification.id == notification_id,
+                Notification.user_id == user_id,
+            )
+        )
+        notification = result.scalar_one_or_none()
+        if not notification:
+            raise NotFoundException("Notification not found")
+        if not notification.is_read:
+            notification.is_read = True
+            notification.read_at = _utc_now_naive()
+            await self.db.flush()
+            await self.db.refresh(notification)
+        return notification
+
+    async def mark_all_user_notifications_read(self, user_id: UUID) -> int:
+        result = await self.db.execute(
+            update(Notification)
+            .where(Notification.user_id == user_id, Notification.is_read.is_(False))
+            .values(is_read=True, read_at=_utc_now_naive())
+        )
+        await self.db.flush()
+        return int(result.rowcount or 0)
+
+    async def delete_notification(
+        self,
+        notification_id: UUID,
+        *,
+        user_id: UUID | None = None,
+        driver_id: UUID | None = None,
+    ) -> bool:
+        filters = [Notification.id == notification_id]
+        if user_id:
+            filters.append(Notification.user_id == user_id)
+        if driver_id:
+            filters.append(Notification.driver_id == driver_id)
+        result = await self.db.execute(select(Notification).where(*filters))
+        notification = result.scalar_one_or_none()
+        if not notification:
+            raise NotFoundException("Notification not found")
+        await self.db.delete(notification)
+        await self.db.flush()
+        return True
 
     def _is_ride_request_row(self, notification: Notification) -> bool:
         data = notification.data or {}
@@ -282,7 +732,6 @@ class NotificationService:
             if ride_status is None or ride_status != RideStatus.SEARCHING_DRIVER.value:
                 continue
 
-            # Keep for real-time popup polling; alerts UI hides these client-side.
             filtered.append(notification)
 
         return filtered
