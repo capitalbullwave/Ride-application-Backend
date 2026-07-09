@@ -1,13 +1,20 @@
 """Permanently remove a driver account and related data."""
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import AuthDevice, UserSession
-from app.core.constants import ACTIVE_RIDE_STATUSES
-from app.core.exceptions import ConflictException, NotFoundException
-from app.drivers.models import DriverBankAccount, DriverDocument, DriverLocation
+from app.commission.models import DriverWallet, DriverWalletTransaction
+from app.core.constants import DRIVER_ACTIVE_RIDE_STATUSES, RideStatus
+from app.core.exceptions import NotFoundException
+from app.drivers.models import (
+    DriverBankAccount,
+    DriverDocument,
+    DriverEmergencyContact,
+    DriverLocation,
+)
 from app.models import Driver, Ride
 from app.notifications.models import Notification
 from app.ratings.models import Rating
@@ -16,7 +23,7 @@ from app.services.image_storage import delete_driver_uploads
 from app.support.models import SupportTicket
 from app.utils.phone import normalize_phone, phone_lookup_variants
 from app.vehicles.models import Vehicle
-from app.wallet.models import Wallet, WithdrawalRequest
+from app.wallet.models import Wallet, WalletTransaction, WithdrawalRequest
 
 
 def _signup_conflict_conditions(phone: str, email: str):
@@ -34,21 +41,61 @@ def _signup_conflict_conditions(phone: str, email: str):
     return or_(*conditions)
 
 
+async def _unlink_driver_rides(db: AsyncSession, driver_id: UUID) -> None:
+    """Cancel active trips and detach the driver from ride history."""
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(Ride)
+        .where(
+            Ride.driver_id == driver_id,
+            Ride.status.in_(tuple(DRIVER_ACTIVE_RIDE_STATUSES)),
+        )
+        .values(
+            status=RideStatus.CANCELLED.value,
+            cancelled_at=now,
+            cancelled_by="ADMIN",
+            cancellation_reason="Driver account deleted by admin",
+        )
+    )
+    await db.execute(
+        update(Ride).where(Ride.driver_id == driver_id).values(driver_id=None, vehicle_id=None)
+    )
+    await db.execute(
+        update(Ride)
+        .where(
+            Ride.vehicle_id.in_(select(Vehicle.id).where(Vehicle.driver_id == driver_id))
+        )
+        .values(vehicle_id=None)
+    )
+
+
 async def _delete_driver_dependencies(db: AsyncSession, driver_id: UUID) -> None:
     """Delete child rows explicitly — SQLAlchemy ORM delete can nullify required FKs."""
     await db.execute(delete(WithdrawalRequest).where(WithdrawalRequest.driver_id == driver_id))
+    await db.execute(
+        delete(WalletTransaction).where(
+            WalletTransaction.wallet_id.in_(
+                select(Wallet.id).where(Wallet.driver_id == driver_id)
+            )
+        )
+    )
+    await db.execute(delete(Wallet).where(Wallet.driver_id == driver_id))
+    await db.execute(
+        delete(DriverWalletTransaction).where(DriverWalletTransaction.driver_id == driver_id)
+    )
+    await db.execute(delete(DriverWallet).where(DriverWallet.driver_id == driver_id))
     await db.execute(delete(DriverBankAccount).where(DriverBankAccount.driver_id == driver_id))
     await db.execute(delete(DriverDocument).where(DriverDocument.driver_id == driver_id))
     await db.execute(delete(DriverLocation).where(DriverLocation.driver_id == driver_id))
     await db.execute(
-        update(Ride).where(Ride.driver_id == driver_id).values(driver_id=None, vehicle_id=None)
+        delete(DriverEmergencyContact).where(DriverEmergencyContact.driver_id == driver_id)
     )
+    await _unlink_driver_rides(db, driver_id)
     await db.execute(delete(Vehicle).where(Vehicle.driver_id == driver_id))
     await db.execute(delete(Rating).where(Rating.driver_id == driver_id))
     await db.execute(delete(Notification).where(Notification.driver_id == driver_id))
     await db.execute(delete(UserSession).where(UserSession.driver_id == driver_id))
     await db.execute(delete(AuthDevice).where(AuthDevice.driver_id == driver_id))
-    await db.execute(delete(Wallet).where(Wallet.driver_id == driver_id))
     await db.execute(
         update(SupportTicket).where(SupportTicket.driver_id == driver_id).values(driver_id=None)
     )
@@ -68,7 +115,7 @@ async def purge_soft_deleted_driver_signup_conflicts(
     for driver in stale_drivers:
         await _delete_driver_dependencies(db, driver.id)
         delete_driver_uploads(str(driver.id))
-        await db.delete(driver)
+        await db.execute(delete(Driver).where(Driver.id == driver.id))
     if stale_drivers:
         await db.flush()
 
@@ -78,14 +125,6 @@ async def permanently_delete_driver(db: AsyncSession, driver_id: UUID) -> None:
     driver = result.scalar_one_or_none()
     if not driver:
         raise NotFoundException("Driver not found")
-
-    active_ride = await db.execute(
-        select(Ride.id)
-        .where(Ride.driver_id == driver_id, Ride.status.in_(tuple(ACTIVE_RIDE_STATUSES)))
-        .limit(1)
-    )
-    if active_ride.scalar_one_or_none():
-        raise ConflictException("Cannot delete driver while they have an active ride")
 
     matching = DriverMatchingService(db)
     await matching.set_driver_offline(driver_id)
@@ -98,5 +137,5 @@ async def permanently_delete_driver(db: AsyncSession, driver_id: UUID) -> None:
 
     await _delete_driver_dependencies(db, driver_id)
     delete_driver_uploads(str(driver_id))
-    await db.delete(driver)
+    await db.execute(delete(Driver).where(Driver.id == driver_id))
     await db.flush()

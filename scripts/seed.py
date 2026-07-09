@@ -1,31 +1,21 @@
 """Seed database with initial data."""
 import asyncio
-import uuid
-from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
+from app.bootstrap.default_data import ensure_default_vehicle_types
 from app.core.security import hash_password
 from app.database.session import AsyncSessionLocal
 from app.admin.models import AdminRolePermission
 from app.core.constants import UserRole
-from app.models import AdminPermission, AdminRole, AdminUser, City, User, VehicleType
+from app.models import AdminPermission, AdminRole, AdminUser, City, User
 
 
 async def seed():
     async with AsyncSessionLocal() as db:
-        # Vehicle Types
-        existing = await db.execute(select(VehicleType))
-        if not existing.scalars().first():
-            types = [
-                VehicleType(name="Bike", slug="bike", description="Two-wheeler rides", base_fare=25, per_km_rate=8, per_minute_rate=1.5, capacity=1),
-                VehicleType(name="Auto", slug="auto", description="Three-wheeler auto rickshaw", base_fare=30, per_km_rate=10, per_minute_rate=1.5, capacity=3),
-                VehicleType(name="Economy", slug="economy", description="Affordable everyday rides", base_fare=40, per_km_rate=12, per_minute_rate=2, capacity=4),
-                VehicleType(name="Comfort", slug="comfort", description="Extra legroom and comfort", base_fare=60, per_km_rate=16, per_minute_rate=2.5, capacity=4),
-                VehicleType(name="Premium", slug="premium", description="Luxury vehicles", base_fare=100, per_km_rate=25, per_minute_rate=3, capacity=4),
-                VehicleType(name="XL", slug="xl", description="6-seater for groups", base_fare=80, per_km_rate=18, per_minute_rate=2.5, capacity=6),
-            ]
-            db.add_all(types)
+        added_types = await ensure_default_vehicle_types(db)
+        if added_types:
+            print(f"Added {added_types} vehicle type(s).")
 
         # Admin Role & Permissions
         role_result = await db.execute(select(AdminRole).where(AdminRole.name == "Super Admin"))

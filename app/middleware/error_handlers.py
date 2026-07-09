@@ -46,6 +46,8 @@ def register_exception_handlers(app: FastAPI) -> None:
             message = "This phone number is already registered"
         elif "drivers" in err and "email" in err:
             message = "This email is already registered"
+        elif "foreign key" in err or "violates" in err or "still referenced" in err:
+            message = "Cannot delete this record because related data still exists"
         elif "users" in err and "phone" in err:
             message = "This phone number is already registered"
         elif "users" in err and "email" in err:

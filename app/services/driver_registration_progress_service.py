@@ -33,6 +33,20 @@ from app.services.vehicle_document_requirements import (
 from app.vehicles.models import Vehicle, VehicleType
 
 
+def _placeholder_license_plate(driver_id: UUID) -> str:
+    """Per-driver placeholder until a real plate is saved (license_plate is globally unique)."""
+    return f"PD{driver_id.hex[:18].upper()}"
+
+
+def _is_placeholder_plate(plate: str | None) -> bool:
+    if not plate:
+        return True
+    normalized = plate.strip().upper()
+    if normalized in ("", "PENDING"):
+        return True
+    return len(normalized) == 20 and normalized.startswith("PD")
+
+
 class DriverRegistrationProgressService:
     LICENSE_FRONT = "DRIVING_LICENSE"
     LICENSE_BACK = "DRIVING_LICENSE_BACK"
@@ -104,13 +118,8 @@ class DriverRegistrationProgressService:
         self, documents: list[DriverDocument], driver: Driver
     ) -> bool:
         license_front = self._doc_url(documents, self.LICENSE_FRONT)
-        license_back = self._doc_url(documents, self.LICENSE_BACK)
         license_number = (driver.license_number or "").strip()
-        return (
-            bool(license_front)
-            and bool(license_back)
-            and license_number not in ("", "PENDING")
-        )
+        return bool(license_front) and license_number not in ("", "PENDING")
 
     def _profile_done(self, driver: Driver) -> bool:
         return (
@@ -126,7 +135,7 @@ class DriverRegistrationProgressService:
         if not vehicle:
             return False
         plate = (vehicle.license_plate or "").strip()
-        if plate in ("", "PENDING"):
+        if _is_placeholder_plate(plate):
             return False
         rc_front = self._doc_url(documents, "VEHICLE_RC")
         rc_back = self._doc_url(documents, "VEHICLE_RC_BACK")
@@ -189,7 +198,7 @@ class DriverRegistrationProgressService:
                 completed=license_done,
                 status=step_status(
                     license_done,
-                    [self.LICENSE_FRONT, self.LICENSE_BACK],
+                    [self.LICENSE_FRONT],
                 ),
             ),
             RegistrationStepInfo(
@@ -290,7 +299,7 @@ class DriverRegistrationProgressService:
         vehicle_number = None
         if vehicle:
             plate = (vehicle.license_plate or "").strip()
-            if plate and plate != "PENDING":
+            if not _is_placeholder_plate(plate):
                 vehicle_number = plate
 
         return DriverSavedRegistrationData(
@@ -382,7 +391,7 @@ class DriverRegistrationProgressService:
         if stored:
             driver.profile_photo = stored
         await self.driver_repo.update(driver)
-        return {"message": "Profile saved"}
+        return {"message": "Profile saved", "profile_photo": driver.profile_photo}
 
     async def save_vehicle_type(self, driver: Driver, data: SaveVehicleTypeStep) -> dict:
         vehicle = await self._vehicle_for(driver.id)
@@ -392,7 +401,7 @@ class DriverRegistrationProgressService:
             vehicle = Vehicle(
                 driver_id=driver.id,
                 vehicle_type_id=data.vehicle_type_id,
-                license_plate="PENDING",
+                license_plate=_placeholder_license_plate(driver.id),
                 make="Standard",
                 model="Standard",
                 color="Unknown",
@@ -496,7 +505,7 @@ class DriverRegistrationProgressService:
             )
         if not self._license_done(documents, driver):
             raise ValidationException(
-                "Driving license front, back and number are required"
+                "Driving license front and number are required"
             )
         if not self._vehicle_number_done(documents, vehicle):
             raise ValidationException(
