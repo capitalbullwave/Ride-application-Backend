@@ -1,10 +1,9 @@
 """Payment gateways and wallet operations."""
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID
 
-import razorpay
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,7 +28,9 @@ class PaymentGateway(ABC):
         pass
 
 
-def _razorpay_client() -> razorpay.Client:
+def _razorpay_client() -> Any:
+    import razorpay
+
     settings = get_settings()
     if not settings.razorpay_key_id or not settings.razorpay_key_secret:
         raise ValidationException("Razorpay is not configured on the server")
