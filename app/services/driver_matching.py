@@ -1,4 +1,6 @@
 import json
+import time
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -20,6 +22,12 @@ DRIVER_META_PREFIX = "driver:meta:"
 DRIVER_PENDING_PREFIX = "driver:pending:"
 RIDE_REQUESTS_PREFIX = "ride:requests:"
 
+# In-process fallback when Redis is down (single uvicorn worker).
+_local_pending_by_driver: dict[str, set[str]] = {}
+_local_drivers_by_ride: dict[str, set[str]] = {}
+_last_redispatch_at: dict[str, float] = {}
+_REDISPATCH_COOLDOWN_SEC = 8.0
+
 
 class DriverMatchingService:
     def __init__(self, db: AsyncSession):
@@ -33,14 +41,87 @@ class DriverMatchingService:
             logger.warning("redis_unavailable", error=str(exc))
             return None
 
-    async def _persist_driver_location(
-        self,
-        driver_id: UUID,
-        lat: float,
-        lng: float,
-        heading: Optional[float] = None,
-        speed: Optional[float] = None,
-    ) -> None:
+    @staticmethod
+    def _remember_local_pending(ride_id: str, driver_ids: List[str]) -> None:
+        _local_drivers_by_ride.setdefault(ride_id, set()).update(driver_ids)
+        for driver_id in driver_ids:
+            _local_pending_by_driver.setdefault(driver_id, set()).add(ride_id)
+
+    @staticmethod
+    def _clear_local_pending_ride(ride_id: str) -> None:
+        drivers = _local_drivers_by_ride.pop(ride_id, set())
+        for driver_id in drivers:
+            pending = _local_pending_by_driver.get(driver_id)
+            if not pending:
+                continue
+            pending.discard(ride_id)
+            if not pending:
+                _local_pending_by_driver.pop(driver_id, None)
+
+    @staticmethod
+    def _clear_local_driver_pending(driver_id: str, ride_id: str) -> None:
+        pending = _local_pending_by_driver.get(driver_id)
+        if pending:
+            pending.discard(ride_id)
+            if not pending:
+                _local_pending_by_driver.pop(driver_id, None)
+        drivers = _local_drivers_by_ride.get(ride_id)
+        if drivers:
+            drivers.discard(driver_id)
+            if not drivers:
+                _local_drivers_by_ride.pop(ride_id, None)
+
+    @staticmethod
+    def searching_freshness_cutoff() -> datetime:
+        """Only rides still within the active search window are offerable."""
+        seconds = max(30, int(settings.driver_request_timeout_seconds or 180))
+        return datetime.now(timezone.utc) - timedelta(seconds=seconds)
+
+    async def expire_stale_searching_rides(self) -> int:
+        """Cancel SEARCHING_DRIVER rides older than the request timeout."""
+        from app.core.constants import RideStatus
+
+        cutoff = self.searching_freshness_cutoff()
+        # DB may store naive timestamps — compare safely.
+        cutoff_naive = cutoff.replace(tzinfo=None)
+        result = await self.db.execute(
+            select(Ride).where(
+                Ride.status == RideStatus.SEARCHING_DRIVER.value,
+                Ride.created_at < cutoff_naive,
+            ).limit(50)
+        )
+        stale = list(result.scalars().all())
+        if not stale:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        for ride in stale:
+            ride.status = RideStatus.CANCELLED.value
+            ride.cancelled_at = now
+            ride.cancelled_by = "SYSTEM"
+            ride.cancellation_reason = "Search timed out — no driver accepted"
+            self._clear_local_pending_ride(str(ride.id))
+        await self.db.flush()
+        logger.info("stale_searching_rides_expired", count=len(stale))
+        return len(stale)
+
+    async def filter_fresh_searching_ride_ids(self, ride_ids: List[UUID]) -> List[UUID]:
+        """Keep only rides that are currently SEARCHING and still fresh."""
+        from app.core.constants import RideStatus
+
+        if not ride_ids:
+            return []
+        cutoff = self.searching_freshness_cutoff().replace(tzinfo=None)
+        result = await self.db.execute(
+            select(Ride.id).where(
+                Ride.id.in_(ride_ids),
+                Ride.status == RideStatus.SEARCHING_DRIVER.value,
+                Ride.created_at >= cutoff,
+            )
+        )
+        fresh = {row[0] for row in result.all()}
+        return [ride_id for ride_id in ride_ids if ride_id in fresh]
+
         result = await self.db.execute(
             select(DriverLocation).where(DriverLocation.driver_id == driver_id)
         )
@@ -274,12 +355,16 @@ class DriverMatchingService:
         return drivers
 
     async def send_ride_request(self, ride_id: UUID, driver_ids: List[str]) -> None:
+        ride_key = str(ride_id)
+        self._remember_local_pending(ride_key, driver_ids)
+
         redis = await self._get_redis()
         if not redis:
             logger.warning(
                 "ride_request_redis_skipped",
-                ride_id=str(ride_id),
+                ride_id=ride_key,
                 driver_count=len(driver_ids),
+                fallback="local_memory",
             )
             return
 
@@ -287,10 +372,10 @@ class DriverMatchingService:
             key = f"{RIDE_REQUESTS_PREFIX}{ride_id}"
             for driver_id in driver_ids:
                 await redis.sadd(key, driver_id)
-                await redis.sadd(f"{DRIVER_PENDING_PREFIX}{driver_id}", str(ride_id))
+                await redis.sadd(f"{DRIVER_PENDING_PREFIX}{driver_id}", ride_key)
                 await redis.publish(
                     "ride_requests",
-                    json.dumps({"ride_id": str(ride_id), "driver_id": driver_id}),
+                    json.dumps({"ride_id": ride_key, "driver_id": driver_id}),
                 )
             await redis.expire(key, settings.driver_request_timeout_seconds)
             for driver_id in driver_ids:
@@ -300,21 +385,24 @@ class DriverMatchingService:
                 )
             logger.info(
                 "ride_request_sent_redis",
-                ride_id=str(ride_id),
+                ride_id=ride_key,
                 driver_ids=driver_ids,
                 timeout_seconds=settings.driver_request_timeout_seconds,
             )
         except Exception as exc:
             logger.error(
                 "ride_request_redis_failed",
-                ride_id=str(ride_id),
+                ride_id=ride_key,
                 driver_ids=driver_ids,
                 error=str(exc),
+                fallback="local_memory",
             )
 
     async def get_pending_ride_ids(self, driver_id: UUID) -> List[UUID]:
-        redis = await self._get_redis()
+        await self.expire_stale_searching_rides()
+
         pending: List[UUID] = []
+        redis = await self._get_redis()
         if redis:
             try:
                 raw = await redis.smembers(f"{DRIVER_PENDING_PREFIX}{driver_id}")
@@ -323,8 +411,17 @@ class DriverMatchingService:
             except Exception:
                 pass
 
+        if not pending:
+            local = _local_pending_by_driver.get(str(driver_id), set())
+            pending = [UUID(ride_id) for ride_id in local]
+
         if pending:
-            return pending
+            fresh = await self.filter_fresh_searching_ride_ids(pending)
+            # Drop stale IDs from local memory so they never resurface.
+            for ride_id in pending:
+                if ride_id not in fresh:
+                    self._clear_local_driver_pending(str(driver_id), str(ride_id))
+            return fresh
 
         return await self._open_ride_request_ids_from_db(driver_id)
 
@@ -332,6 +429,7 @@ class DriverMatchingService:
         from app.core.constants import RideStatus
         from app.models import Notification, Ride
 
+        cutoff = self.searching_freshness_cutoff().replace(tzinfo=None)
         result = await self.db.execute(
             select(Notification)
             .where(Notification.driver_id == driver_id)
@@ -362,12 +460,14 @@ class DriverMatchingService:
             select(Ride.id).where(
                 Ride.id.in_(ride_ids),
                 Ride.status == RideStatus.SEARCHING_DRIVER.value,
+                Ride.created_at >= cutoff,
             )
         )
         open_ids = {row[0] for row in status_result.all()}
         return [ride_id for ride_id in ride_ids if ride_id in open_ids]
 
     async def remember_pending_ride(self, driver_id: UUID, ride_id: UUID) -> None:
+        self._remember_local_pending(str(ride_id), [str(driver_id)])
         redis = await self._get_redis()
         if not redis:
             return
@@ -384,6 +484,7 @@ class DriverMatchingService:
             pass
 
     async def clear_driver_pending(self, driver_id: UUID, ride_id: UUID) -> None:
+        self._clear_local_driver_pending(str(driver_id), str(ride_id))
         redis = await self._get_redis()
         if not redis:
             return
@@ -396,6 +497,7 @@ class DriverMatchingService:
 
     async def clear_ride_requests(self, ride_id: UUID) -> None:
         """Remove a ride from all driver pending sets when cancelled or completed."""
+        self._clear_local_pending_ride(str(ride_id))
         redis = await self._get_redis()
         if not redis:
             return
@@ -435,6 +537,44 @@ class DriverMatchingService:
             )
         )
         return list(fallback.scalars().all())
+
+    async def list_open_searching_rides_for_driver(
+        self, driver: Driver, *, limit: int = 5
+    ) -> List[Ride]:
+        """Only present (fresh) SEARCHING_DRIVER rides — never past/stale searches."""
+        from app.core.constants import RideStatus
+        from sqlalchemy.orm import selectinload
+
+        await self.expire_stale_searching_rides()
+        cutoff = self.searching_freshness_cutoff().replace(tzinfo=None)
+
+        vehicle_type_ids: list[UUID] = []
+        vt_result = await self.db.execute(
+            select(Vehicle.vehicle_type_id).where(
+                Vehicle.driver_id == driver.id,
+                Vehicle.is_deleted.is_(False),
+            )
+        )
+        vehicle_type_ids = [row[0] for row in vt_result.all() if row[0]]
+
+        query = (
+            select(Ride)
+            .options(selectinload(Ride.user))
+            .where(
+                Ride.status == RideStatus.SEARCHING_DRIVER.value,
+                Ride.created_at >= cutoff,
+            )
+            .order_by(Ride.created_at.desc())
+            .limit(limit)
+        )
+        result = await self.db.execute(query)
+        rides = list(result.scalars().unique().all())
+
+        if vehicle_type_ids:
+            matched = [r for r in rides if r.vehicle_type_id in vehicle_type_ids]
+            if matched:
+                return matched
+        return rides
 
     async def dispatch_ride_to_online_drivers(self, ride: Ride, ws_manager=None) -> int:
         from app.notifications.service import NotificationService
@@ -532,6 +672,87 @@ class DriverMatchingService:
             drivers_notified=len(drivers),
             driver_ids=driver_ids,
             websocket=ws_manager is not None,
+        )
+        return len(drivers)
+
+    async def rediscover_searching_ride(self, ride: Ride, ws_manager=None) -> int:
+        """Re-ping online drivers for a stuck SEARCHING_DRIVER ride (throttled).
+
+        Uses local/Redis pending + websocket only — avoids spamming new DB
+        notifications every few seconds while the user is searching.
+        """
+        from app.core.constants import RideStatus
+        from sqlalchemy.orm import selectinload
+
+        if ride.status != RideStatus.SEARCHING_DRIVER.value:
+            return 0
+
+        cutoff = self.searching_freshness_cutoff()
+        created = ride.created_at
+        if created is not None:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created < cutoff:
+                logger.info(
+                    "driver_redispatch_skipped_stale",
+                    ride_id=str(ride.id),
+                )
+                return 0
+
+        ride_key = str(ride.id)
+        now = time.monotonic()
+        last = _last_redispatch_at.get(ride_key, 0.0)
+        if now - last < _REDISPATCH_COOLDOWN_SEC:
+            return 0
+        _last_redispatch_at[ride_key] = now
+
+        result = await self.db.execute(
+            select(Ride).options(selectinload(Ride.user)).where(Ride.id == ride.id)
+        )
+        ride = result.scalar_one()
+        drivers = await self._online_drivers_for_ride(ride)
+        if not drivers:
+            logger.warning(
+                "driver_redispatch_no_drivers",
+                ride_id=ride_key,
+            )
+            return 0
+
+        driver_ids = [str(d.id) for d in drivers]
+        await self.send_ride_request(ride.id, driver_ids)
+
+        passenger_name = (
+            f"{ride.user.first_name} {ride.user.last_name}".strip()
+            if ride.user
+            else "Passenger"
+        )
+        payload = {
+            "event": "ride_request",
+            "ride_id": str(ride.id),
+            "pickup_address": ride.pickup_address,
+            "dropoff_address": ride.dropoff_address,
+            "pickup_lat": ride.pickup_lat,
+            "pickup_lng": ride.pickup_lng,
+            "dropoff_lat": ride.dropoff_lat,
+            "dropoff_lng": ride.dropoff_lng,
+            "estimated_fare": float(ride.estimated_fare or 0),
+            "estimated_distance_km": float(ride.estimated_distance_km or 0),
+            "estimated_duration_min": float(ride.estimated_duration_min or 0),
+            "payment_method": ride.payment_method,
+            "passenger_name": passenger_name,
+            "passenger_phone": ride.user.phone if ride.user else None,
+            "status": ride.status,
+            "actions": ["accept", "reject"],
+        }
+        if ws_manager:
+            for driver in drivers:
+                await ws_manager.send_personal(str(driver.id), payload)
+
+        logger.info(
+            "driver_redispatch_completed",
+            ride_id=ride_key,
+            drivers_notified=len(drivers),
+            driver_ids=driver_ids,
         )
         return len(drivers)
 

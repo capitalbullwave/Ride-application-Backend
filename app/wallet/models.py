@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -13,6 +13,27 @@ from app.core.database import Base, TimestampMixin, UUIDMixin
 if TYPE_CHECKING:
     from app.drivers.models import Driver, DriverBankAccount
     from app.users.models import User
+
+
+class UserBankAccount(UUIDMixin, TimestampMixin, Base):
+    __tablename__ = "user_bank_accounts"
+    __table_args__ = (Index("ix_user_bank_primary", "user_id", "is_primary"),)
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    account_holder_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    account_number_masked: Mapped[str] = mapped_column(String(50), nullable=False)
+    ifsc_code: Mapped[str] = mapped_column(String(20), nullable=False)
+    bank_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    upi_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    user: Mapped["User"] = relationship("User", back_populates="bank_accounts")
+    withdrawals: Mapped[List["WithdrawalRequest"]] = relationship(
+        "WithdrawalRequest", back_populates="user_bank_account"
+    )
 
 
 class Wallet(UUIDMixin, TimestampMixin, Base):
@@ -81,23 +102,38 @@ class WalletTopUpPayment(UUIDMixin, TimestampMixin, Base):
 
 class WithdrawalRequest(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "withdrawal_requests"
-    __table_args__ = (Index("ix_withdrawals_driver_status", "driver_id", "status"),)
+    __table_args__ = (
+        Index("ix_withdrawals_driver_status", "driver_id", "status"),
+        Index("ix_withdrawals_user_status", "user_id", "status"),
+    )
 
-    driver_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("drivers.id", ondelete="CASCADE"), nullable=False, index=True
+    driver_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("drivers.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     wallet_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    bank_account_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("driver_bank_accounts.id", ondelete="RESTRICT"), nullable=False
+    bank_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("driver_bank_accounts.id", ondelete="RESTRICT"), nullable=True
+    )
+    user_bank_account_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_bank_accounts.id", ondelete="RESTRICT"), nullable=True
     )
     amount: Mapped[float] = mapped_column(Float, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default=WithdrawalStatus.PENDING.value, nullable=False, index=True)
     rejection_reason: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     processed_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    driver: Mapped["Driver"] = relationship("Driver", back_populates="withdrawals")
+    driver: Mapped[Optional["Driver"]] = relationship("Driver", back_populates="withdrawals")
+    user: Mapped[Optional["User"]] = relationship("User", back_populates="withdrawals")
     wallet: Mapped["Wallet"] = relationship("Wallet", back_populates="withdrawals")
-    bank_account: Mapped["DriverBankAccount"] = relationship("DriverBankAccount", back_populates="withdrawals")
+    bank_account: Mapped[Optional["DriverBankAccount"]] = relationship(
+        "DriverBankAccount", back_populates="withdrawals"
+    )
+    user_bank_account: Mapped[Optional["UserBankAccount"]] = relationship(
+        "UserBankAccount", back_populates="withdrawals"
+    )

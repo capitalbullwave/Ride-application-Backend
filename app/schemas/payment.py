@@ -16,7 +16,7 @@ class WalletResponse(BaseSchema):
 
 class WalletTopUp(BaseModel):
     amount: float = Field(..., gt=0, le=100000)
-    payment_method: str = "RAZORPAY"
+    payment_method: str = "CASHFREE"
 
 
 class WalletTransactionResponse(BaseSchema):

@@ -61,6 +61,62 @@ class DriverWalletService:
         await self.db.flush()
         return txn
 
+    async def credit_bonus(
+        self,
+        *,
+        driver_id: uuid.UUID,
+        amount: float,
+        description: str,
+    ) -> DriverWalletTransaction:
+        if amount < 0:
+            raise ValidationException("Credit amount cannot be negative")
+
+        wallet = await self.get_or_create(driver_id)
+        new_balance = round(float(wallet.available_balance) + amount, 2)
+        wallet.available_balance = new_balance
+        wallet.lifetime_earnings = round(float(wallet.lifetime_earnings) + amount, 2)
+
+        txn = DriverWalletTransaction(
+            driver_id=driver_id,
+            ride_id=None,
+            wallet_id=wallet.id,
+            type=DriverWalletTransactionType.CREDIT.value,
+            amount=amount,
+            description=description,
+            balance_after_transaction=new_balance,
+        )
+        self.db.add(txn)
+        await self.db.flush()
+        return txn
+
+    async def admin_credit(
+        self,
+        *,
+        driver_id: uuid.UUID,
+        amount: float,
+        note: str | None = None,
+    ) -> DriverWalletTransaction:
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            raise ValidationException("Amount must be greater than zero")
+        description = (note or "").strip() or "Admin wallet credit"
+        wallet = await self.get_or_create(driver_id)
+        new_balance = round(float(wallet.available_balance) + amount, 2)
+        wallet.available_balance = new_balance
+
+        txn = DriverWalletTransaction(
+            driver_id=driver_id,
+            ride_id=None,
+            wallet_id=wallet.id,
+            type=DriverWalletTransactionType.ADJUSTMENT.value,
+            amount=amount,
+            description=description[:500],
+            balance_after_transaction=new_balance,
+        )
+        self.db.add(txn)
+        await self.db.flush()
+        return txn
+
     async def list_transactions(
         self,
         driver_id: uuid.UUID,

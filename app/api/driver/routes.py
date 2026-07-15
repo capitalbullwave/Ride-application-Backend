@@ -134,7 +134,7 @@ class EndRideRequest(BaseModel):
 
 class CollectPaymentRequest(BaseModel):
     ride_id: UUID
-    method: str = Field(..., pattern="^(CASH|RAZORPAY)$")
+    method: str = Field(..., pattern="^(CASH|CASHFREE|UPI)$")
 
 
 @router.get("/profile", response_model=DriverResponse)
@@ -315,6 +315,50 @@ async def go_online(driver: Annotated[Driver, Depends(get_current_driver)], db: 
     matching = DriverMatchingService(db)
     lat, lng = await matching.driver_default_location(driver.id)
     await matching.ensure_driver_online(driver, lat, lng)
+
+    # Immediately attach only PRESENT fresh searching rides (never past/stale).
+    try:
+        open_rides = await matching.list_open_searching_rides_for_driver(driver, limit=3)
+        for ride in open_rides:
+            await matching.remember_pending_ride(driver.id, ride.id)
+            await manager.send_personal(
+                str(driver.id),
+                {
+                    "event": "ride_request",
+                    "ride_id": str(ride.id),
+                    "pickup_address": ride.pickup_address,
+                    "dropoff_address": ride.dropoff_address,
+                    "pickup_lat": ride.pickup_lat,
+                    "pickup_lng": ride.pickup_lng,
+                    "dropoff_lat": ride.dropoff_lat,
+                    "dropoff_lng": ride.dropoff_lng,
+                    "estimated_fare": float(ride.estimated_fare or 0),
+                    "estimated_distance_km": float(ride.estimated_distance_km or 0),
+                    "estimated_duration_min": float(ride.estimated_duration_min or 0),
+                    "payment_method": ride.payment_method,
+                    "passenger_name": (
+                        f"{ride.user.first_name} {ride.user.last_name}".strip()
+                        if ride.user
+                        else "Passenger"
+                    ),
+                    "passenger_phone": ride.user.phone if ride.user else None,
+                    "status": ride.status,
+                    "actions": ["accept", "reject"],
+                },
+            )
+        if open_rides:
+            logger.info(
+                "driver_online_open_rides_attached",
+                driver_id=str(driver.id),
+                count=len(open_rides),
+            )
+    except Exception as exc:
+        logger.warning(
+            "driver_online_open_rides_attach_failed",
+            driver_id=str(driver.id),
+            error=str(exc),
+        )
+
     return {"status": driver.status}
 
 
@@ -354,27 +398,44 @@ async def update_location(
 
 @router.get("/ride-requests")
 async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], db: AsyncSession = Depends(get_db)):
+    """Return open ride requests for this online driver.
+
+    Prefer Redis/local pending IDs, but always fall back to DB SEARCHING_DRIVER
+    rides so requests still appear when Redis is down or the API was restarted.
+    """
     from sqlalchemy.orm import selectinload
 
     matching = DriverMatchingService(db)
+    await matching.expire_stale_searching_rides()
     pending_ids = await matching.get_pending_ride_ids(driver.id)
 
-    if not pending_ids:
-        return []
+    rides_by_id: dict = {}
 
-    query = (
-        select(Ride)
-        .options(selectinload(Ride.user))
-        .where(
-            Ride.id.in_(pending_ids),
-            Ride.status == RideStatus.SEARCHING_DRIVER.value,
+    if pending_ids:
+        cutoff = matching.searching_freshness_cutoff().replace(tzinfo=None)
+        result = await db.execute(
+            select(Ride)
+            .options(selectinload(Ride.user))
+            .where(
+                Ride.id.in_(pending_ids),
+                Ride.status == RideStatus.SEARCHING_DRIVER.value,
+                Ride.created_at >= cutoff,
+            )
+            .order_by(Ride.created_at.desc())
+            .limit(5)
         )
-        .order_by(Ride.created_at.desc())
-        .limit(20)
-    )
+        for ride in result.scalars().all():
+            rides_by_id[ride.id] = ride
 
-    result = await db.execute(query)
-    rides = list(result.scalars().all())
+    # Hard fallback: only present fresh searching rides
+    if not rides_by_id:
+        open_rides = await matching.list_open_searching_rides_for_driver(driver, limit=5)
+        for ride in open_rides:
+            rides_by_id[ride.id] = ride
+
+    rides = list(rides_by_id.values())
+    rides.sort(key=lambda r: r.created_at or r.id, reverse=True)
+    rides = rides[:5]
 
     for ride in rides:
         await matching.remember_pending_ride(driver.id, ride.id)
@@ -383,6 +444,7 @@ async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], 
         "driver_ride_requests",
         driver_id=str(driver.id),
         pending_count=len(rides),
+        from_pending_ids=len(pending_ids),
     )
 
     return [
@@ -403,7 +465,7 @@ async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], 
             ),
             "passenger_phone": r.user.phone if r.user else None,
             "status": r.status,
-            "created_at": r.created_at.isoformat(),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rides
     ]
@@ -657,23 +719,37 @@ async def collect_payment(
         )
         return payload
 
-    payment = await payment_service.create_ride_qr_payment(ride.id, ride.user_id, fare)
-    ride.payment_method = PaymentMethod.RAZORPAY.value
+    payment = await payment_service.create_ride_qr_payment(
+        ride.id,
+        ride.user_id,
+        fare,
+        customer_phone=getattr(ride.user, "phone", None) if ride.user else None,
+        customer_email=getattr(ride.user, "email", None) if ride.user else None,
+        customer_name=(
+            f"{getattr(ride.user, 'first_name', '')} {getattr(ride.user, 'last_name', '')}".strip()
+            if ride.user
+            else None
+        ),
+    )
+    method_value = payment.payment_method or PaymentMethod.CASHFREE.value
+    ride.payment_method = method_value
     await db.commit()
     qr_data = payment.gateway_response or {}
-    payload = _payment_breakdown_payload(ride, PaymentMethod.RAZORPAY.value)
+    payload = _payment_breakdown_payload(ride, method_value)
     payload.update(
         {
             "success": True,
             "payment_status": payment.status,
             "payment_collected": False,
-            "qr_code_id": qr_data.get("qr_code_id") or qr_data.get("payment_link_id"),
+            "provider": "cashfree",
+            "qr_code_id": qr_data.get("qr_code_id")
+            or qr_data.get("order_id")
+            or qr_data.get("payment_link_id"),
             "payment_link_id": qr_data.get("payment_link_id") or qr_data.get("qr_code_id"),
             "short_url": qr_data.get("short_url"),
             "image_url": qr_data.get("image_url"),
             "image_content": qr_data.get("image_content"),
             "amount": fare,
-            "key_id": qr_data.get("key_id"),
         }
     )
     return payload
@@ -793,6 +869,58 @@ async def driver_wallet(driver: Annotated[Driver, Depends(get_current_driver)], 
     }
     if bank:
         payload["bank"] = bank_to_response(bank).model_dump()
+    return payload
+
+
+class _WithdrawRequest(BaseModel):
+    amount: float = Field(..., gt=0)
+
+
+@router.post("/wallet/withdraw")
+async def driver_wallet_withdraw(
+    data: _WithdrawRequest,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    wr = await AdminFinanceService(db).create_driver_withdrawal(driver, data.amount)
+    return {
+        "id": str(wr.id),
+        "amount": float(wr.amount),
+        "status": wr.status.lower(),
+        "message": "Withdrawal request submitted",
+    }
+
+@router.get("/refer-earn")
+async def driver_refer_earn(
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    payload = await service.dashboard_for_driver(driver)
+    await db.commit()
+    return payload
+
+
+@router.post("/refer-earn/apply")
+async def driver_apply_refer_earn_code(
+    data: dict,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.core.exceptions import ValidationException
+    from app.services.referral_service import ReferralService
+
+    code = str(data.get("code") or data.get("referral_code") or "").strip()
+    if not code:
+        raise ValidationException("Referral code is required")
+    service = ReferralService(db)
+    await service.apply_driver_referral(driver, code)
+    payload = await service.dashboard_for_driver(driver)
+    await db.commit()
     return payload
 
 

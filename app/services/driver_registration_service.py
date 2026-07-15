@@ -41,8 +41,19 @@ class DriverRegistrationService:
         driver.license_number = data.license_number
         driver.date_of_birth = data.date_of_birth
         driver.gender = data.gender
-        driver.referral_code = data.referral_code
         driver.address_line = data.current_address
+        # Ensure shareable invite code exists for this captain
+        from app.core.exceptions import AppException
+        from app.services.referral_service import ReferralService
+
+        referral_service = ReferralService(self.db)
+        await referral_service.ensure_driver_invite_code(driver)
+        # Optional signup referral — do not block registration if already applied / invalid
+        if data.referral_code and str(data.referral_code).strip():
+            try:
+                await referral_service.apply_driver_referral(driver, data.referral_code)
+            except AppException:
+                pass
         driver.city = data.city
         driver.state = data.state
         driver.country = data.country
@@ -98,9 +109,11 @@ class DriverRegistrationService:
 
         bank_id = None
         if data.bank:
+            full_account = "".join(c for c in data.bank.account_number if c.isdigit())
             bank = DriverBankAccount(
                 driver_id=driver.id,
                 account_holder_name=data.bank.account_holder_name.strip(),
+                account_number=full_account or None,
                 account_number_masked=_mask_account_number(data.bank.account_number),
                 ifsc_code=data.bank.ifsc_code.strip().upper(),
                 bank_name=data.bank.bank_name.strip(),

@@ -75,6 +75,13 @@ class RideSettlementService:
 
     await self.db.flush()
 
+    try:
+      from app.services.referral_service import ReferralService
+
+      await ReferralService(self.db).process_after_ride_completed(ride)
+    except Exception:
+      logger.exception("Referral processing failed for ride %s", ride.id)
+
     if driver_earning > 0:
       try:
         notif = NotificationService(self.db)

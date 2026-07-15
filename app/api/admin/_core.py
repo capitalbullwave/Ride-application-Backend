@@ -45,6 +45,18 @@ def _user_status(user: User) -> str:
     return "active"
 
 
+def _apply_user_status(user: User, status: str) -> None:
+    normalized = (status or "").strip().lower()
+    if normalized == "active":
+        user.is_active = True
+        user.is_verified = True
+    elif normalized == "inactive":
+        user.is_active = True
+        user.is_verified = False
+    elif normalized in ("blocked", "suspended"):
+        user.is_active = False
+
+
 def _map_user(user: User, wallet_balance: float = 0.0, total_rides: int = 0) -> dict:
     email = user.email or ""
     # Hide auto-generated placeholder emails (phone@ridebook.app) in admin.
@@ -56,6 +68,7 @@ def _map_user(user: User, wallet_balance: float = 0.0, total_rides: int = 0) -> 
             email = ""
     return {
         "id": str(user.id),
+        "publicId": user.public_id,
         "name": f"{user.first_name} {user.last_name}".strip(),
         "mobile": user.phone,
         "email": email,
@@ -64,7 +77,7 @@ def _map_user(user: User, wallet_balance: float = 0.0, total_rides: int = 0) -> 
         "walletBalance": wallet_balance,
         "status": _user_status(user),
         "avatar": user.profile_photo,
-        "city": "",
+        "gender": (user.gender or "").strip().lower(),
         "rating": round(float(getattr(user, "rating_avg", 0.0) or 0.0), 2),
         "emergencyContactName": user.emergency_contact_name or "",
         "emergencyContactPhone": format_phone_display(user.emergency_contact_phone)
@@ -115,6 +128,7 @@ def _map_driver(
 
     payload = {
         "id": str(driver.id),
+        "publicId": driver.public_id,
         "name": f"{driver.first_name} {driver.last_name}".strip(),
         "phone": driver.phone,
         "email": driver.email,
@@ -146,14 +160,9 @@ def _map_driver(
     }
 
     if bank:
-        payload["bankDetails"] = {
-            "accountHolder": bank.account_holder_name,
-            "accountNumber": bank.account_number_masked,
-            "ifsc": bank.ifsc_code,
-            "bankName": bank.bank_name,
-            "upiId": bank.upi_id or "",
-            "isVerified": bank.is_verified,
-        }
+        from app.services.driver_bank_service import bank_to_admin_dict
+
+        payload["bankDetails"] = bank_to_admin_dict(bank)
 
     return payload
 
@@ -195,9 +204,12 @@ def _map_ride(ride: Ride, user: User | None = None, driver: Driver | None = None
     }
     return {
         "id": str(ride.id),
+        "publicId": ride.public_id,
         "userId": str(ride.user_id),
+        "userPublicId": user.public_id if user else "",
         "userName": f"{user.first_name} {user.last_name}" if user else "",
         "driverId": str(ride.driver_id) if ride.driver_id else None,
+        "driverPublicId": driver.public_id if driver else None,
         "driverName": f"{driver.first_name} {driver.last_name}" if driver else None,
         "vehicleType": "sedan",
         "pickupLocation": ride.pickup_address,
@@ -334,8 +346,19 @@ async def update_user(
         user.email = data["email"]
     if data.get("mobile"):
         user.phone = data["mobile"]
+    if data.get("gender") is not None:
+        gender = str(data["gender"]).strip().lower()
+        user.gender = gender or None
+    if data.get("status"):
+        _apply_user_status(user, str(data["status"]))
     await db.flush()
-    return _map_user(user)
+
+    wallet_result = await db.execute(select(Wallet).where(Wallet.user_id == user.id))
+    wallet = wallet_result.scalar_one_or_none()
+    rides_count = (
+        await db.execute(select(func.count()).select_from(Ride).where(Ride.user_id == user.id))
+    ).scalar_one()
+    return _map_user(user, wallet.balance if wallet else 0.0, rides_count)
 
 
 async def _set_user_active(user_id: UUID, db: AsyncSession, active: bool, verified: bool | None = None) -> dict:
@@ -583,6 +606,114 @@ async def get_driver(
     )
     bank = bank_result.scalar_one_or_none()
     return _map_driver(driver, vehicle, wallet_balance, bank, commission_earnings)
+
+
+class _DriverWalletCreditBody(BaseModel):
+    amount: float = Field(..., gt=0)
+    note: str | None = Field(default=None, max_length=500)
+
+
+@router.get("/drivers/{driver_id}/wallet")
+async def driver_wallet(
+    driver_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    driver = await db.get(Driver, driver_id)
+    if not driver or driver.is_deleted:
+        raise NotFoundException("Driver not found")
+
+    from app.services.driver_wallet_service import DriverWalletService
+
+    svc = DriverWalletService(db)
+    wallet = await svc.get_or_create(driver_id)
+    txs, total = await svc.list_transactions(driver_id, page=1, page_size=50)
+    return {
+        "availableBalance": float(wallet.available_balance),
+        "pendingBalance": float(wallet.pending_balance),
+        "lifetimeEarnings": float(wallet.lifetime_earnings),
+        "total": total,
+        "transactions": [
+            {
+                "id": str(tx.id),
+                "type": (tx.type or "").lower(),
+                "amount": float(tx.amount),
+                "description": tx.description,
+                "balanceAfter": float(tx.balance_after_transaction),
+                "date": tx.created_at.isoformat() if tx.created_at else None,
+            }
+            for tx in txs
+        ],
+    }
+
+
+@router.post("/drivers/{driver_id}/wallet/credit")
+async def driver_wallet_credit(
+    driver_id: UUID,
+    data: _DriverWalletCreditBody,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    driver = await db.get(Driver, driver_id)
+    if not driver or driver.is_deleted:
+        raise NotFoundException("Driver not found")
+
+    from app.services.driver_wallet_service import DriverWalletService
+
+    svc = DriverWalletService(db)
+    note = data.note or f"Admin credit by {admin.email or admin.id}"
+    tx = await svc.admin_credit(driver_id=driver_id, amount=data.amount, note=note)
+    wallet = await svc.get_or_create(driver_id)
+    return {
+        "availableBalance": float(wallet.available_balance),
+        "pendingBalance": float(wallet.pending_balance),
+        "lifetimeEarnings": float(wallet.lifetime_earnings),
+        "transaction": {
+            "id": str(tx.id),
+            "type": (tx.type or "").lower(),
+            "amount": float(tx.amount),
+            "description": tx.description,
+            "balanceAfter": float(tx.balance_after_transaction),
+            "date": tx.created_at.isoformat() if tx.created_at else None,
+        },
+    }
+
+
+class _DriverBankUpdateBody(BaseModel):
+    accountHolder: str = Field(..., min_length=2, max_length=150)
+    accountNumber: str = Field(..., min_length=9, max_length=30)
+    ifsc: str = Field(..., min_length=11, max_length=20)
+    bankName: str = Field(..., min_length=2, max_length=100)
+    upiId: str | None = Field(default=None, max_length=100)
+
+
+@router.put("/drivers/{driver_id}/bank")
+async def update_driver_bank(
+    driver_id: UUID,
+    data: _DriverBankUpdateBody,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    driver = await db.get(Driver, driver_id)
+    if not driver or driver.is_deleted:
+        raise NotFoundException("Driver not found")
+
+    from app.schemas.driver import DriverBankUpsert
+    from app.services.driver_bank_service import DriverBankService, bank_to_admin_dict
+
+    await DriverBankService(db).upsert(
+        driver_id,
+        DriverBankUpsert(
+            account_holder_name=data.accountHolder,
+            account_number=data.accountNumber,
+            ifsc_code=data.ifsc,
+            bank_name=data.bankName,
+            upi_id=data.upiId,
+            payment_type="bank",
+        ),
+    )
+    bank = await DriverBankService(db).get_primary(driver_id)
+    return bank_to_admin_dict(bank) if bank else {}
 
 
 @router.patch("/drivers/{driver_id}")

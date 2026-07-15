@@ -17,7 +17,7 @@ from app.auth.dependencies import get_current_admin
 from app.core.constants import DriverStatus, KYCStatus, RideStatus, SupportTicketPriority, SupportTicketStatus
 from app.core.exceptions import ConflictException, NotFoundException, ValidationException
 from app.database.session import get_db
-from app.services.image_storage import persist_vehicle_type_image
+from app.services.image_storage import persist_vehicle_type_image, resolve_vehicle_icon_url
 from app.services.user_benefits_service import map_student_pass, map_subscription_plan
 from app.commission.schemas import (
     VehicleCommissionSettingsResponse,
@@ -54,7 +54,8 @@ DEFAULT_SETTINGS = {
     "contactPhone": "+91 98765 43210",
     "googleMapsApiKey": "",
     "firebaseConfig": "",
-    "razorpayKey": "",
+    "cashfreeAppId": "",
+    "cashfreeSecretKey": "",
     "stripeKey": "",
     "driverCommission": 20,
     "platformFee": 5,
@@ -111,11 +112,7 @@ def _vehicle_slug(name: str) -> str:
 
 
 def _vehicle_image_url(icon: str | None) -> str | None:
-    if not icon:
-        return None
-    if icon.startswith(("/", "http://", "https://")):
-        return icon
-    return None
+    return resolve_vehicle_icon_url(icon)
 
 
 def _vehicle_icon_type(icon: str | None) -> str:
@@ -146,6 +143,7 @@ def _map_vehicle_type(vt: VehicleType) -> dict:
         "imageUrl": image_url,
         "capacity": vt.capacity,
         "serviceGroup": vt.service_group or "ride",
+        "displayOrder": vt.display_order,
         "driverCommissionPercentage": float(
             vt.driver_commission_percentage
             if vt.driver_commission_percentage is not None
@@ -277,7 +275,8 @@ async def _get_settings(db: AsyncSession) -> dict:
         "contact_phone": "contactPhone",
         "google_maps_api_key": "googleMapsApiKey",
         "firebase_config": "firebaseConfig",
-        "razorpay_key": "razorpayKey",
+        "cashfree_app_id": "cashfreeAppId",
+        "cashfree_secret_key": "cashfreeSecretKey",
         "stripe_key": "stripeKey",
         "logo": "logo",
     }
@@ -684,17 +683,188 @@ async def finance_transactions(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
 ):
-    query = (
+    base = (
         select(WalletTransaction, Wallet)
         .join(Wallet, WalletTransaction.wallet_id == Wallet.id)
-        .order_by(WalletTransaction.created_at.desc())
     )
-    result = await db.execute(query.offset((page - 1) * limit).limit(limit))
+    if type and type != "all":
+        base = base.where(func.lower(WalletTransaction.transaction_type) == type.lower())
+
+    total = int(
+        (
+            await db.execute(
+                select(func.count(WalletTransaction.id))
+                .select_from(WalletTransaction)
+                .join(Wallet, WalletTransaction.wallet_id == Wallet.id)
+                .where(
+                    *(
+                        [func.lower(WalletTransaction.transaction_type) == type.lower()]
+                        if type and type != "all"
+                        else []
+                    )
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    result = await db.execute(
+        base.order_by(WalletTransaction.created_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
     rows = result.all()
     items = [_map_wallet_transaction(tx, wallet) for tx, wallet in rows]
-    if type and type != "all":
-        items = [i for i in items if i["type"] == type]
-    return {"items": items, "total": len(items)}
+    return {"items": items, "total": total}
+
+
+@router.get("/finance/overview")
+async def finance_overview(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).overview()
+
+
+@router.get("/finance/commission-report")
+async def finance_commission_report(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).commission_report()
+
+
+@router.get("/finance/payouts")
+async def finance_payouts(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).list_payouts(status=status, page=page, limit=limit)
+
+
+class _RejectPayoutBody(BaseModel):
+    reason: str | None = None
+
+
+@router.post("/finance/payouts/process-all")
+async def finance_process_all_payouts(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).process_all_pending(admin.id)
+
+
+@router.post("/finance/payouts/{payout_id}/process")
+async def finance_process_payout(
+    payout_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).process_payout(payout_id, admin.id)
+
+
+@router.post("/finance/payouts/{payout_id}/reject")
+async def finance_reject_payout(
+    payout_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    data: _RejectPayoutBody = _RejectPayoutBody(),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).reject_payout(payout_id, admin.id, data.reason)
+
+
+@router.get("/finance/refunds")
+async def finance_refunds(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).list_refunds(page=page, limit=limit)
+
+
+@router.get("/finance/wallet-transactions")
+async def finance_wallet_transactions(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    owner: str = Query("user"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).list_wallet_transactions(
+        owner=owner, page=page, limit=limit
+    )
+
+
+@router.get("/finance/activity")
+async def finance_activity(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    party: str | None = Query(None, description="all|user|driver"),
+    category: str | None = Query(None, description="all|wallet|earning|payout|payment|refund|referral"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).list_activity(
+        party=party, category=category, page=page, limit=limit
+    )
+
+
+@router.get("/finance/approvals")
+async def finance_approvals(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).list_approvals()
+
+
+@router.post("/finance/refunds/{payment_id}/approve")
+async def finance_approve_refund(
+    payment_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).approve_refund(payment_id, admin.id)
+
+
+class _RejectRefundBody(BaseModel):
+    reason: str | None = None
+
+
+@router.post("/finance/refunds/{payment_id}/reject")
+async def finance_reject_refund(
+    payment_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    data: _RejectRefundBody = _RejectRefundBody(),
+):
+    from app.services.admin_finance_service import AdminFinanceService
+
+    return await AdminFinanceService(db).reject_refund(payment_id, admin.id, data.reason)
 
 
 @router.get("/vehicle-categories")
@@ -702,7 +872,9 @@ async def list_vehicle_categories(
     admin: Annotated[AdminUser, Depends(get_current_admin)],
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(VehicleType).order_by(VehicleType.name))
+    result = await db.execute(
+        select(VehicleType).order_by(VehicleType.service_group, VehicleType.display_order, VehicleType.name)
+    )
     return [_map_vehicle_type(vt) for vt in result.scalars().all()]
 
 
@@ -716,15 +888,27 @@ async def create_vehicle_category(
         raise ValidationException("Vehicle name is required")
 
     slug = (data.get("slug") or _vehicle_slug(name)).strip().lower().replace(" ", "-")
+    service_group = (data.get("serviceGroup") or "ride").strip().lower()
+
     existing = await db.execute(
-        select(VehicleType).where(or_(VehicleType.name == name, VehicleType.slug == slug))
+        select(VehicleType).where(
+            VehicleType.service_group == service_group,
+            or_(VehicleType.name == name, VehicleType.slug == slug),
+        )
     )
     if existing.scalar_one_or_none():
-        raise ConflictException("A vehicle category with this name already exists")
+        raise ConflictException(
+            f"A {service_group} vehicle category with this name already exists"
+        )
 
     base_fare = float(data.get("baseFare", 25))
     per_km_rate = float(data.get("perKmFare", 10))
-    service_group = (data.get("serviceGroup") or "ride").strip().lower()
+
+    max_order = await db.scalar(
+        select(func.coalesce(func.max(VehicleType.display_order), -1)).where(
+            VehicleType.service_group == service_group
+        )
+    )
 
     vt = VehicleType(
         name=name,
@@ -733,17 +917,20 @@ async def create_vehicle_category(
         icon=data.get("icon", "car"),
         base_fare=base_fare,
         per_km_rate=per_km_rate,
-        per_minute_rate=float(data.get("perMinuteRate", 2)),
+        per_minute_rate=float(data.get("perMinuteRate", 0)),
         waiting_charge_per_min=float(data.get("waitingCharge", 2)),
         included_distance_km=float(data.get("includedDistanceKm", 2)),
         included_hours=float(data.get("includedHours", 4 if service_group == "rental" else 0)),
         per_hour_rate=float(data.get("perHourRate", 50 if service_group == "rental" else 0)),
         minimum_fare=float(data.get("minimumFare", base_fare)),
         cancellation_charge=float(
-            data.get("cancellationCharge", max(base_fare, 20.0))
+            data["cancellationCharge"]
+            if "cancellationCharge" in data
+            else max(base_fare, 20.0)
         ),
         service_group=service_group,
         capacity=int(data.get("capacity", 4)),
+        display_order=int(data.get("displayOrder", (max_order or -1) + 1)),
         is_active=data.get("isActive", True),
     )
     db.add(vt)
@@ -784,6 +971,7 @@ async def update_vehicle_category(
         "description": "description",
         "icon": "icon",
         "capacity": "capacity",
+        "displayOrder": "display_order",
     }
     image_payload = data.get("image") or data.get("imageUrl")
     for front_key, db_key in field_map.items():
@@ -796,6 +984,21 @@ async def update_vehicle_category(
                 continue
             setattr(vt, db_key, data[front_key])
     if "name" in data:
+        new_name = (data["name"] or "").strip()
+        if new_name:
+            new_slug = _vehicle_slug(new_name)
+            service_group = (data.get("serviceGroup") or vt.service_group or "ride").strip().lower()
+            conflict = await db.execute(
+                select(VehicleType).where(
+                    VehicleType.id != category_id,
+                    VehicleType.service_group == service_group,
+                    or_(VehicleType.name == new_name, VehicleType.slug == new_slug),
+                )
+            )
+            if conflict.scalar_one_or_none():
+                raise ConflictException(
+                    f"A {service_group} vehicle category with this name already exists"
+                )
         vt.slug = _vehicle_slug(vt.name)
     if image_payload:
         stored = persist_vehicle_type_image(image_payload, str(vt.id))
@@ -828,6 +1031,28 @@ async def delete_vehicle_category(
     await db.delete(vt)
     await db.flush()
     return {"success": True, "deactivated": False}
+
+
+async def reorder_vehicle_categories(
+    data: dict,
+    admin: AdminUser,
+    db: AsyncSession,
+):
+    items = data.get("items") or []
+    if not items:
+        raise ValidationException("items list is required")
+
+    for item in items:
+        category_id = item.get("id")
+        if not category_id:
+            continue
+        vt = await db.get(VehicleType, UUID(str(category_id)))
+        if not vt:
+            continue
+        vt.display_order = int(item.get("displayOrder", 0))
+
+    await db.flush()
+    return {"success": True}
 
 
 @router.get("/coupons")
@@ -907,6 +1132,93 @@ async def delete_coupon(
     await db.delete(promo)
     await db.flush()
     return {"success": True, "deactivated": False}
+
+
+@router.get("/referral-programs")
+async def list_referral_programs(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    programs = await service.ensure_default_programs()
+    await db.commit()
+    return [ReferralService.serialize_program(p) for p in programs]
+
+
+@router.put("/referral-programs/{audience}")
+async def update_referral_program(
+    audience: str,
+    data: dict,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    await service.ensure_default_programs()
+    payload = {
+        "is_enabled": data.get("isEnabled", data.get("is_enabled")),
+        "required_rides": data.get("requiredRides", data.get("required_rides")),
+        "reward_amount": data.get("rewardAmount", data.get("reward_amount")),
+        "title": data.get("title"),
+        "description": data.get("description"),
+        "terms": data.get("terms"),
+        "share_message": data.get("shareMessage", data.get("share_message")),
+    }
+    # Drop keys not provided so upsert doesn't overwrite with None incorrectly
+    clean = {k: v for k, v in payload.items() if v is not None}
+    if "isEnabled" in data or "is_enabled" in data:
+        clean["is_enabled"] = bool(data.get("isEnabled", data.get("is_enabled")))
+    program = await service.upsert_program(audience, clean)
+    await db.commit()
+    return ReferralService.serialize_program(program)
+
+
+@router.get("/referral-rewards")
+async def list_referral_rewards(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    audience: str | None = None,
+    status: str | None = None,
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    items = await service.list_rewards_admin(audience=audience, status=status)
+    await db.commit()
+    return {
+        "items": items,
+        "summary": {
+            "total": len(items),
+            "pending": sum(1 for i in items if i["status"] == "PENDING"),
+            "paid": sum(1 for i in items if i["status"] == "PAID"),
+            "cancelled": sum(1 for i in items if i["status"] == "CANCELLED"),
+            "totalPaidAmount": sum(float(i["rewardAmount"]) for i in items if i["status"] == "PAID"),
+        },
+    }
+
+
+@router.patch("/referral-rewards/{reward_id}")
+async def update_referral_reward(
+    reward_id: UUID,
+    data: dict,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    payload = {
+        "required_rides": data.get("requiredRides", data.get("required_rides")),
+        "reward_amount": data.get("rewardAmount", data.get("reward_amount")),
+        "action": data.get("action"),
+        "status": data.get("status"),
+    }
+    item = await service.admin_update_reward(reward_id, payload)
+    await db.commit()
+    return item
 
 
 @router.get("/support/tickets")
@@ -1238,7 +1550,8 @@ async def update_settings(
         "contactPhone": "contact_phone",
         "googleMapsApiKey": "google_maps_api_key",
         "firebaseConfig": "firebase_config",
-        "razorpayKey": "razorpay_key",
+        "cashfreeAppId": "cashfree_app_id",
+        "cashfreeSecretKey": "cashfree_secret_key",
         "stripeKey": "stripe_key",
         "logo": "logo",
     }

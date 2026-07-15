@@ -67,6 +67,25 @@ def delete_driver_uploads(driver_id: str) -> None:
         shutil.rmtree(folder, ignore_errors=True)
 
 
+def resolve_vehicle_icon_url(icon: str | None) -> str | None:
+    """Return a public media URL only when the icon is reachable on disk or remote."""
+    if not icon or not icon.strip():
+        return None
+
+    text = icon.strip()
+    if text.startswith(("http://", "https://")):
+        return text
+
+    if text.startswith("/uploads/"):
+        rel = text.removeprefix("/uploads/").lstrip("/")
+        path = _upload_root() / rel
+        if path.is_file():
+            return text
+        return None
+
+    return None
+
+
 def persist_vehicle_type_image(value: str | None, vehicle_type_id: str, prefix: str = "icon") -> str | None:
     """Accept http(s) URL or data:image/...;base64,... and return stored path."""
     if not value or not value.strip():

@@ -154,3 +154,14 @@ async def delete_vehicle_category_route(
     from app.api.admin._extended import delete_vehicle_category
 
     return await delete_vehicle_category(category_id, admin, db)
+
+
+@router.post("/vehicle-categories/reorder")
+async def reorder_vehicle_categories_route(
+    data: dict,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.api.admin._extended import reorder_vehicle_categories
+
+    return await reorder_vehicle_categories(data, admin, db)

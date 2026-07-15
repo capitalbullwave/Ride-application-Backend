@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
 from app.models import AppSetting, VehicleType
+from app.services.image_storage import resolve_vehicle_icon_url
 
 router = APIRouter(tags=["Common"])
 
@@ -16,6 +17,7 @@ DEFAULT_CITIES = [
 
 
 def _serialize_vehicle_type(vt: VehicleType) -> dict:
+    image_url = resolve_vehicle_icon_url(vt.icon)
     return {
         "id": str(vt.id),
         "slug": vt.slug or vt.name.lower().replace(" ", "-"),
@@ -28,7 +30,8 @@ def _serialize_vehicle_type(vt: VehicleType) -> dict:
         "per_hour_rate": vt.per_hour_rate,
         "per_minute_rate": vt.per_minute_rate,
         "waiting_charge_per_min": vt.waiting_charge_per_min,
-        "icon_url": vt.icon,
+        "icon_url": image_url,
+        "image_url": image_url,
         "service_group": vt.service_group or "ride",
         "capacity": vt.capacity,
     }
@@ -42,7 +45,7 @@ async def vehicle_types(
     query = select(VehicleType).where(VehicleType.is_active == True)
     if service_group:
         query = query.where(VehicleType.service_group == service_group.strip().lower())
-    result = await db.execute(query.order_by(VehicleType.name))
+    result = await db.execute(query.order_by(VehicleType.display_order, VehicleType.name))
     return [_serialize_vehicle_type(vt) for vt in result.scalars().all()]
 
 
@@ -51,7 +54,7 @@ async def rental_categories(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(VehicleType)
         .where(VehicleType.is_active == True, VehicleType.service_group == "rental")
-        .order_by(VehicleType.name)
+        .order_by(VehicleType.display_order, VehicleType.name)
     )
     return [_serialize_vehicle_type(vt) for vt in result.scalars().all()]
 

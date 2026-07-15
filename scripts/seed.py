@@ -3,7 +3,6 @@ import asyncio
 
 from sqlalchemy import select
 
-from app.bootstrap.default_data import ensure_default_vehicle_types
 from app.core.security import hash_password
 from app.database.session import AsyncSessionLocal
 from app.admin.models import AdminRolePermission
@@ -13,10 +12,7 @@ from app.models import AdminPermission, AdminRole, AdminUser, City, User
 
 async def seed():
     async with AsyncSessionLocal() as db:
-        added_types = await ensure_default_vehicle_types(db)
-        if added_types:
-            print(f"Added {added_types} vehicle type(s).")
-
+        # Vehicle types are managed from the admin panel only — not seeded here.
         # Admin Role & Permissions
         role_result = await db.execute(select(AdminRole).where(AdminRole.name == "Super Admin"))
         role = role_result.scalar_one_or_none()

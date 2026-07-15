@@ -14,6 +14,18 @@ class RideEstimateRequest(BaseModel):
     dropoff_lat: float = Field(..., ge=-90, le=90, description="Dropoff latitude")
     dropoff_lng: float = Field(..., ge=-180, le=180, description="Dropoff longitude")
     vehicle_type_id: Optional[uuid.UUID] = Field(None, description="Filter estimate to one vehicle type")
+    service_group: Optional[str] = Field(default="ride", description="ride or rental")
+    rental_hours: Optional[float] = Field(default=None, ge=0)
+    distance_km: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Route distance from maps (km). When set, used instead of straight-line geodesic.",
+    )
+    duration_min: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Route duration from maps (minutes). Optional when distance_km is provided.",
+    )
 
 
 class VehicleTypeEstimate(BaseModel):
@@ -51,6 +63,16 @@ class RideBookRequest(BaseModel):
     promo_code: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     rental_hours: Optional[float] = Field(default=None, ge=0)
+    distance_km: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Route distance from maps (km). When set, used instead of straight-line geodesic.",
+    )
+    duration_min: Optional[float] = Field(
+        default=None,
+        ge=0,
+        description="Route duration from maps (minutes). Optional when distance_km is provided.",
+    )
 
 
 class RideCancelRequest(BaseModel):
@@ -75,6 +97,7 @@ class RideTimelineEvent(BaseSchema):
 
 class RideResponse(BaseSchema):
     id: uuid.UUID
+    public_id: str
     user_id: uuid.UUID
     driver_id: Optional[uuid.UUID] = None
     vehicle_id: Optional[uuid.UUID] = None

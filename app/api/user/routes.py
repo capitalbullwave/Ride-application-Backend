@@ -33,6 +33,7 @@ from app.services.subscription_payment_service import (
     activate_user_subscription,
 )
 from app.services.wallet_payment_service import WalletPaymentService
+from app.services.women_safety_service import notify_women_safety_enabled
 from app.api.websocket.manager import manager
 
 logger = get_logger(__name__)
@@ -46,6 +47,8 @@ class ProfileUpdate(BaseModel):
     email: str | None = None
     emergency_contact_name: str | None = None
     emergency_contact_phone: str | None = None
+    gender: str | None = None
+    referral_code: str | None = None
 
 
 class SavedAddressCreate(BaseModel):
@@ -68,6 +71,9 @@ class BookRideRequest(BaseModel):
     promo_code: str | None = None
     rental_hours: float | None = Field(default=None, ge=0)
     scheduled_at: datetime | None = None
+    women_safety_enabled: bool = False
+    distance_km: float | None = Field(default=None, ge=0)
+    duration_min: float | None = Field(default=None, ge=0)
 
 
 class ValidateCouponRequest(BaseModel):
@@ -132,14 +138,12 @@ class PaymentRequest(BaseModel):
     description: str = "Wallet top-up"
 
 
+class WalletVerifyPayment(BaseModel):
+    order_id: str = Field(..., min_length=5, max_length=100)
+
+
 class WalletCheckoutRequest(BaseModel):
     amount: float = Field(..., gt=0, le=100000)
-
-
-class WalletVerifyPayment(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
 
 
 def _address_response(address: SavedAddress) -> dict:
@@ -156,12 +160,14 @@ def _address_response(address: SavedAddress) -> dict:
 def _user_to_profile(user: User, addresses: list[SavedAddress], total_rides: int = 0) -> dict:
     return {
         "id": str(user.id),
+        "public_id": user.public_id,
         "phone": format_phone_display(user.phone),
         "full_name": f"{user.first_name} {user.last_name}".strip(),
         "email": user.email,
         "profile_image_url": user.profile_photo,
         "emergency_contact_name": user.emergency_contact_name,
         "emergency_contact_phone": user.emergency_contact_phone,
+        "gender": user.gender,
         "total_rides": total_rides,
         "addresses": [_address_response(a) for a in addresses],
     }
@@ -170,6 +176,7 @@ def _user_to_profile(user: User, addresses: list[SavedAddress], total_rides: int
 def _ride_summary(ride: Ride) -> dict:
     return {
         "id": str(ride.id),
+        "public_id": ride.public_id,
         "pickup_address": ride.pickup_address,
         "dropoff_address": ride.dropoff_address,
         "status": ride.status,
@@ -283,6 +290,19 @@ async def update_profile(
         user.emergency_contact_name = data.emergency_contact_name
     if data.emergency_contact_phone is not None:
         user.emergency_contact_phone = data.emergency_contact_phone
+    if data.gender is not None:
+        user.gender = data.gender.strip().lower() or None
+    if data.referral_code and data.referral_code.strip():
+        from app.core.exceptions import AppException
+        from app.services.referral_service import ReferralService
+
+        try:
+            await ReferralService(db).apply_user_referral(user, data.referral_code.strip())
+        except AppException as exc:
+            # Allow profile save if code was already applied earlier in signup
+            msg = (getattr(exc, "message", None) or str(exc)).lower()
+            if "already applied" not in msg:
+                raise
     await UserRepository(db).update(user)
     result = await db.execute(select(SavedAddress).where(SavedAddress.user_id == user.id))
     ride_count = (
@@ -423,8 +443,20 @@ async def book_ride(
         promo_code=data.promo_code,
         rental_hours=data.rental_hours,
         scheduled_at=data.scheduled_at,
+        distance_km=data.distance_km,
+        duration_min=data.duration_min,
     )
     ride = await RideService(db).create_ride(user.id, ride_data)
+    if data.women_safety_enabled:
+        gender = (user.gender or "").strip().lower()
+        if gender == "female":
+            await notify_women_safety_enabled(db, ride, user)
+        else:
+            logger.info(
+                "women_safety_skipped_non_female_user",
+                user_id=str(user.id),
+                gender=gender or None,
+            )
     logger.info(
         "ride_book_requested",
         ride_id=str(ride.id),
@@ -434,7 +466,15 @@ async def book_ride(
         dropoff_address=data.dropoff_address,
         status=ride.status,
     )
-    notified = await DriverMatchingService(db).dispatch_ride_to_online_drivers(ride, manager)
+    try:
+        notified = await DriverMatchingService(db).dispatch_ride_to_online_drivers(ride, manager)
+    except Exception as exc:
+        logger.error(
+            "ride_dispatch_failed",
+            ride_id=str(ride.id),
+            error=str(exc),
+        )
+        notified = 0
     logger.info(
         "ride_driver_search_dispatched",
         ride_id=str(ride.id),
@@ -466,6 +506,9 @@ async def list_rides(
     if active:
         from sqlalchemy.orm import selectinload
 
+        from app.core.constants import RideStatus
+        from app.services.driver_matching import DriverMatchingService
+
         loaded = await db.execute(
             select(Ride)
             .options(
@@ -477,6 +520,18 @@ async def list_rides(
         )
         active_ride = loaded.scalar_one_or_none()
         if active_ride:
+            # While user is on searching screen, keep re-pinging online drivers.
+            if active_ride.status == RideStatus.SEARCHING_DRIVER.value:
+                try:
+                    await DriverMatchingService(db).rediscover_searching_ride(
+                        active_ride, manager
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "ride_redispatch_failed",
+                        ride_id=str(active_ride.id),
+                        error=str(exc),
+                    )
             active_summary = await _active_ride_summary_enriched(db, active_ride)
     return {
         "active": active_summary,
@@ -562,13 +617,107 @@ async def cancel_ride(
 
 @router.get("/wallet")
 async def get_wallet(user: Annotated[User, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
+    from app.services.user_bank_service import UserBankService, user_bank_to_dict
+
     wallet = await WalletService(db).get_or_create_wallet(user_id=user.id)
-    return {
+    bank = await UserBankService(db).get_primary(user.id)
+    payload = {
         "balance": wallet.balance,
         "bonus_balance": 0.0,
-        "referral_balance": 0.0,
+        "referral_balance": float(wallet.referral_balance or 0),
         "total": wallet.balance,
+        "payment_methods": [],
+        "has_bank_account": bank is not None,
     }
+    if bank:
+        payload["bank"] = user_bank_to_dict(bank)
+    return payload
+
+
+class _UserWithdrawBody(BaseModel):
+    amount: float = Field(..., gt=0)
+
+
+@router.get("/wallet/bank")
+async def get_user_bank(
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.user_bank_service import UserBankService, user_bank_to_dict
+
+    bank = await UserBankService(db).get_primary(user.id)
+    if not bank:
+        raise NotFoundException("No bank account linked")
+    return user_bank_to_dict(bank)
+
+
+@router.post("/wallet/bank")
+async def save_user_bank(
+    data: dict,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.user_bank_service import UserBankService, UserBankUpsert, user_bank_to_dict
+
+    upsert = UserBankUpsert(
+        payment_type=data.get("payment_type") or data.get("paymentType") or "bank",
+        account_holder_name=data.get("account_holder_name")
+        or data.get("accountHolderName")
+        or data.get("account_holder")
+        or "",
+        account_number=data.get("account_number") or data.get("accountNumber"),
+        ifsc_code=data.get("ifsc_code") or data.get("ifscCode") or data.get("ifsc"),
+        bank_name=data.get("bank_name") or data.get("bankName"),
+        upi_id=data.get("upi_id") or data.get("upiId"),
+    )
+    bank = await UserBankService(db).upsert(user.id, upsert)
+    return user_bank_to_dict(bank)
+
+
+@router.post("/wallet/withdraw")
+async def user_wallet_withdraw(
+    data: _UserWithdrawBody,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.user_bank_service import UserWithdrawalService
+
+    wr = await UserWithdrawalService(db).create(user, data.amount)
+    return {
+        "id": str(wr.id),
+        "amount": float(wr.amount),
+        "status": wr.status.lower(),
+        "message": "Withdrawal request submitted. Admin will process the payment.",
+    }
+
+
+@router.get("/refer-earn")
+async def get_refer_earn(
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    service = ReferralService(db)
+    payload = await service.dashboard_for_user(user)
+    await db.commit()
+    return payload
+
+
+@router.post("/refer-earn/apply")
+async def apply_refer_earn_code(
+    data: dict,
+    user: Annotated[User, Depends(get_current_user)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.referral_service import ReferralService
+
+    code = str(data.get("code") or data.get("referral_code") or "").strip()
+    service = ReferralService(db)
+    await service.apply_user_referral(user, code)
+    payload = await service.dashboard_for_user(user)
+    await db.commit()
+    return payload
 
 
 @router.get("/transactions")
@@ -598,7 +747,7 @@ async def add_payment(
     db: AsyncSession = Depends(get_db),
 ):
     raise ValidationException(
-        "Direct wallet credit is disabled. Use POST /user/wallet/checkout and Razorpay payment."
+        "Direct wallet credit is disabled. Use POST /user/wallet/checkout and Cashfree payment."
     )
 
 
@@ -621,9 +770,7 @@ async def wallet_verify_payment(
     service = WalletPaymentService(db)
     return await service.verify_and_credit(
         user,
-        razorpay_order_id=data.razorpay_order_id,
-        razorpay_payment_id=data.razorpay_payment_id,
-        razorpay_signature=data.razorpay_signature,
+        order_id=data.order_id,
     )
 
 
@@ -847,9 +994,7 @@ class SubscriptionCheckoutRequest(BaseModel):
 
 class SubscriptionVerifyPayment(BaseModel):
     plan_slug: str = Field(..., min_length=2, max_length=50)
-    razorpay_order_id: str = Field(..., min_length=5, max_length=100)
-    razorpay_payment_id: str = Field(..., min_length=5, max_length=100)
-    razorpay_signature: str = Field(..., min_length=5, max_length=255)
+    order_id: str = Field(..., min_length=5, max_length=100)
 
 
 @router.get("/student-pass")
@@ -967,9 +1112,7 @@ async def subscription_verify_payment(
     return await service.verify_and_activate(
         user,
         plan_slug=data.plan_slug,
-        razorpay_order_id=data.razorpay_order_id,
-        razorpay_payment_id=data.razorpay_payment_id,
-        razorpay_signature=data.razorpay_signature,
+        order_id=data.order_id,
     )
 
 
@@ -988,7 +1131,7 @@ async def select_subscription_plan(
     if not plan:
         raise NotFoundException("Subscription plan not found")
     if plan.price > 0:
-        raise ValidationException("Paid plans require Razorpay payment. Use subscription checkout.")
+        raise ValidationException("Paid plans require Cashfree payment. Use subscription checkout.")
 
     sub = await activate_user_subscription(db, user.id, plan)
     await db.commit()

@@ -1,7 +1,7 @@
 """Notification service - Push, In-App, FCM, ride lifecycle."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -712,11 +712,20 @@ class NotificationService:
                 continue
 
         statuses: dict[str, str] = {}
+        created_map: dict[str, datetime] = {}
         if ride_ids:
             result = await self.db.execute(
-                select(Ride.id, Ride.status).where(Ride.id.in_(ride_ids))
+                select(Ride.id, Ride.status, Ride.created_at).where(Ride.id.in_(ride_ids))
             )
-            statuses = {str(rid): status for rid, status in result.all()}
+            for rid, status, created_at in result.all():
+                statuses[str(rid)] = status
+                created_map[str(rid)] = created_at
+
+        # Only surface ride requests that are still actively searching and fresh.
+        from app.config.settings import settings
+
+        seconds = max(30, int(settings.driver_request_timeout_seconds or 180))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=seconds)
 
         filtered: list[Notification] = []
         for notification in items:
@@ -728,9 +737,17 @@ class NotificationService:
             if data.get("outcome"):
                 continue
 
-            ride_status = statuses.get(str(data.get("ride_id")))
+            ride_key = str(data.get("ride_id"))
+            ride_status = statuses.get(ride_key)
             if ride_status is None or ride_status != RideStatus.SEARCHING_DRIVER.value:
                 continue
+
+            created = created_map.get(ride_key)
+            if created is not None:
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if created < cutoff:
+                    continue
 
             filtered.append(notification)
 

@@ -379,6 +379,11 @@ class SaveProfileStep(BaseModel):
     city: Optional[str] = Field(default=None, max_length=100)
     state: Optional[str] = Field(default=None, max_length=100)
     country: Optional[str] = Field(default=None, max_length=100)
+    referral_code: Optional[str] = Field(
+        default=None,
+        max_length=50,
+        description="Optional driver invite code applied during onboarding",
+    )
 
     @field_validator("date_of_birth", mode="before")
     @classmethod

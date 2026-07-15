@@ -83,7 +83,7 @@ class CommissionService:
             admin_name = f"{admin.first_name} {admin.last_name}".strip() or admin.email
 
         result = await self.db.execute(
-            select(VehicleType).order_by(VehicleType.service_group, VehicleType.name)
+            select(VehicleType).order_by(VehicleType.service_group, VehicleType.display_order, VehicleType.name)
         )
         vehicles = [
             VehicleCommissionItem(

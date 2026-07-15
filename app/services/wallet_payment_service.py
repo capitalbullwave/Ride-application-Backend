@@ -1,16 +1,18 @@
-"""Razorpay checkout for wallet top-ups."""
+"""Cashfree checkout for wallet top-ups."""
 from __future__ import annotations
-
-import asyncio
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
 from app.core.exceptions import ValidationException
 from app.models import User
-from app.services.payment_service import WalletService, _razorpay_client
+from app.services.cashfree_client import (
+    checkout_payload,
+    create_order,
+    ensure_order_paid,
+    make_order_id,
+)
+from app.services.payment_service import WalletService
 from app.wallet.models import WalletTopUpPayment
 
 
@@ -24,75 +26,53 @@ class WalletPaymentService:
         if amount > 100_000:
             raise ValidationException("Maximum top-up amount is ₹1,00,000")
 
-        amount_paise = max(int(round(amount * 100)), 100)
-        receipt = f"wal_{str(user.id).replace('-', '')[:12]}_{int(datetime.now(timezone.utc).timestamp())}"[
-            :40
-        ]
-
-        def _create_order() -> dict:
-            client = _razorpay_client()
-            return client.order.create(
-                {
-                    "amount": amount_paise,
-                    "currency": "INR",
-                    "receipt": receipt,
-                    "notes": {
-                        "user_id": str(user.id),
-                        "purpose": "wallet_topup",
-                        "amount_inr": str(amount),
-                    },
-                }
-            )
-
-        order = await asyncio.to_thread(_create_order)
-        order_id = order.get("id")
-        if not order_id:
-            raise ValidationException("Unable to create Razorpay order")
+        order_id = make_order_id("wal", str(user.id))
+        order = await create_order(
+            order_id=order_id,
+            amount=amount,
+            customer_id=str(user.id),
+            customer_phone_value=user.phone,
+            customer_email=user.email or "",
+            customer_name=f"{user.first_name} {user.last_name}".strip() or "User",
+            order_note="Wallet top-up",
+            order_tags={"user_id": str(user.id), "purpose": "wallet_topup"},
+        )
 
         payment = WalletTopUpPayment(
             user_id=user.id,
             amount=amount,
             currency="INR",
-            razorpay_order_id=str(order_id),
+            razorpay_order_id=order_id,  # stores Cashfree order_id
             status="PENDING",
+            gateway_response={
+                "provider": "cashfree",
+                "payment_session_id": order.get("payment_session_id"),
+            },
         )
         self.db.add(payment)
         await self.db.commit()
         await self.db.refresh(payment)
 
-        settings = get_settings()
-        if not settings.razorpay_key_id.strip():
-            raise ValidationException("Razorpay is not configured on the server")
-
         return {
-            "checkout": {
-                "order_id": str(order_id),
-                "amount": amount_paise,
-                "currency": "INR",
-                "key_id": settings.razorpay_key_id.strip(),
-                "razorpay_key_id": settings.razorpay_key_id.strip(),
-                "description": f"Wallet top-up ₹{int(amount) if amount == int(amount) else amount}",
-                "prefill": {
+            "checkout": checkout_payload(
+                order_id=order_id,
+                payment_session_id=str(order["payment_session_id"]),
+                amount_inr=amount,
+                description=f"Wallet top-up ₹{int(amount) if amount == int(amount) else amount}",
+                prefill={
                     "name": f"{user.first_name} {user.last_name}".strip() or "User",
                     "email": user.email,
                     "contact": user.phone,
                 },
-            }
+            )
         }
 
-    async def verify_and_credit(
-        self,
-        user: User,
-        *,
-        razorpay_order_id: str,
-        razorpay_payment_id: str,
-        razorpay_signature: str,
-    ) -> dict:
+    async def verify_and_credit(self, user: User, *, order_id: str) -> dict:
         payment = await self.db.scalar(
             select(WalletTopUpPayment)
             .where(
                 WalletTopUpPayment.user_id == user.id,
-                WalletTopUpPayment.razorpay_order_id == razorpay_order_id,
+                WalletTopUpPayment.razorpay_order_id == order_id,
             )
             .order_by(WalletTopUpPayment.created_at.desc())
         )
@@ -122,38 +102,38 @@ class WalletPaymentService:
                 "message": "Wallet already credited for this payment",
             }
 
-        def _verify() -> None:
-            client = _razorpay_client()
-            client.utility.verify_payment_signature(
-                {
-                    "razorpay_order_id": razorpay_order_id,
-                    "razorpay_payment_id": razorpay_payment_id,
-                    "razorpay_signature": razorpay_signature,
-                }
-            )
-
         try:
-            await asyncio.to_thread(_verify)
+            order = await ensure_order_paid(order_id)
         except Exception as exc:
             payment.status = "FAILED"
-            payment.gateway_response = {"error": str(exc)}
+            payment.gateway_response = {
+                **(payment.gateway_response or {}),
+                "error": str(exc),
+            }
             await self.db.commit()
             raise ValidationException("Payment verification failed") from exc
+
+        cf_payment_id = str(
+            order.get("cf_order_id")
+            or (order.get("order_meta") or {}).get("payment_id")
+            or order_id
+        )
 
         txn = await wallet_service.credit(
             wallet.id,
             payment.amount,
-            "Wallet top-up via Razorpay",
-            reference_id=razorpay_payment_id,
+            "Wallet top-up via Cashfree",
+            reference_id=cf_payment_id,
             reference_type="WALLET_TOPUP",
         )
 
         payment.status = "COMPLETED"
-        payment.razorpay_payment_id = razorpay_payment_id
+        payment.razorpay_payment_id = cf_payment_id
         payment.wallet_transaction_id = txn.id
         payment.gateway_response = {
-            "razorpay_order_id": razorpay_order_id,
-            "razorpay_payment_id": razorpay_payment_id,
+            "provider": "cashfree",
+            "order_id": order_id,
+            "order": order,
         }
 
         await self.db.commit()

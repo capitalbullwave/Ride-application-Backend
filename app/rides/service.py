@@ -35,8 +35,15 @@ class FareEngine:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def get_vehicle_types(self) -> list[VehicleType]:
-        result = await self.db.execute(select(VehicleType).where(VehicleType.is_active.is_(True)))
+    async def get_vehicle_types(self, service_group: Optional[str] = None) -> list[VehicleType]:
+        query = (
+            select(VehicleType)
+            .where(VehicleType.is_active.is_(True))
+            .order_by(VehicleType.display_order, VehicleType.name)
+        )
+        if service_group:
+            query = query.where(VehicleType.service_group == service_group.strip().lower())
+        result = await self.db.execute(query)
         return list(result.scalars().all())
 
     async def get_pricing_rule(
@@ -56,6 +63,27 @@ class FareEngine:
     @staticmethod
     def estimate_duration_min(distance_km: float, avg_speed_kmh: float = 30.0) -> float:
         return (distance_km / avg_speed_kmh) * 60
+
+    @staticmethod
+    def resolve_trip_metrics(
+        pickup_lat: float,
+        pickup_lng: float,
+        dropoff_lat: float,
+        dropoff_lng: float,
+        *,
+        distance_km: Optional[float] = None,
+        duration_min: Optional[float] = None,
+    ) -> tuple[float, float]:
+        if distance_km is not None:
+            km = max(0.0, float(distance_km))
+            mins = (
+                max(0.0, float(duration_min))
+                if duration_min is not None
+                else FareEngine.estimate_duration_min(km)
+            )
+            return km, mins
+        km = FareEngine.calculate_distance_km(pickup_lat, pickup_lng, dropoff_lat, dropoff_lng)
+        return km, FareEngine.estimate_duration_min(km)
 
     def is_night_time(self, dt: Optional[datetime] = None) -> bool:
         dt = dt or datetime.now(timezone.utc)
@@ -87,10 +115,14 @@ class FareEngine:
             subtotal = base_fare + time_fare
         else:
             per_km = pricing_rule.per_km_rate if pricing_rule else vehicle_type.per_km_rate
-            per_min = pricing_rule.per_minute_rate if pricing_rule else vehicle_type.per_minute_rate
+            # Admin sets included_distance_km per vehicle (e.g. 2 km). Only distance
+            # beyond that is charged at per_km_rate (e.g. 2.2 km ride → 0.2 × per_km).
+            included_km = float(getattr(vehicle_type, "included_distance_km", 0) or 0)
+            billable_km = max(0.0, distance_km - included_km)
 
-            distance_fare = distance_km * per_km
-            time_fare = duration_min * per_min
+            distance_fare = billable_km * per_km
+            # Ride pricing is distance-based; waiting is billed separately during the trip.
+            time_fare = 0.0
             subtotal = base_fare + distance_fare + time_fare
 
         night_charges = 0.0
@@ -100,14 +132,18 @@ class FareEngine:
 
         peak_charges = subtotal * (surge_multiplier - 1) if surge_multiplier > 1 else 0.0
         # Rentals are hour-based packages; keep the displayed estimate aligned to the configured package rate.
-        # (Ride flow can still apply fees/taxes if needed in the payment layer.)
         if (vehicle_type.service_group or "ride") == "rental":
             platform_fee = 0.0
             tax_amount = 0.0
+            user_fare = subtotal + night_charges + peak_charges - promo_discount
         else:
-            platform_fee = subtotal * (settings.platform_fee_percent / 100)
-            tax_amount = (subtotal + platform_fee) * (settings.tax_percent / 100)
-        total = subtotal + night_charges + peak_charges + platform_fee + tax_amount - promo_discount
+            # User-facing fare matches admin vehicle pricing (base + km beyond included).
+            platform_fee = 0.0
+            tax_amount = 0.0
+            user_fare = subtotal + night_charges + peak_charges - promo_discount
+        minimum_fare = float(
+            getattr(vehicle_type, "minimum_fare", 0) or 0
+        ) or float(base_fare)
 
         return {
             "base_fare": round(base_fare, 2),
@@ -118,17 +154,22 @@ class FareEngine:
             "platform_fee": round(platform_fee, 2),
             "tax_amount": round(tax_amount, 2),
             "promo_discount": round(promo_discount, 2),
-            "estimated_fare": round(max(total, 0), 2),
+            "estimated_fare": round(max(user_fare, minimum_fare, 0), 2),
         }
 
     async def estimate(
         self, data: RideEstimateRequest, user_id: Optional[UUID] = None
     ) -> RideEstimateResponse:
-        distance_km = self.calculate_distance_km(
-            data.pickup_lat, data.pickup_lng, data.dropoff_lat, data.dropoff_lng
+        distance_km, duration_min = self.resolve_trip_metrics(
+            data.pickup_lat,
+            data.pickup_lng,
+            data.dropoff_lat,
+            data.dropoff_lng,
+            distance_km=data.distance_km,
+            duration_min=data.duration_min,
         )
-        duration_min = self.estimate_duration_min(distance_km)
-        vehicle_types = await self.get_vehicle_types()
+        service_group = (data.service_group or "ride").strip().lower()
+        vehicle_types = await self.get_vehicle_types(service_group=service_group)
 
         if data.vehicle_type_id:
             vehicle_types = [vt for vt in vehicle_types if vt.id == data.vehicle_type_id]
@@ -140,7 +181,13 @@ class FareEngine:
         estimates: list[VehicleTypeEstimate] = []
         for vt in vehicle_types:
             rule = await self.get_pricing_rule(vt.id)
-            fare = await self.calculate_fare(vt, distance_km, duration_min, pricing_rule=rule)
+            fare = await self.calculate_fare(
+                vt,
+                distance_km,
+                duration_min,
+                pricing_rule=rule,
+                rental_hours=data.rental_hours,
+            )
             if discount_pct > 0:
                 fare = apply_member_discount_to_fare(fare, discount_pct)
             estimates.append(
@@ -240,10 +287,14 @@ class RideService:
             hours = float(data.rental_hours) if data.rental_hours is not None else float(vehicle_type.included_hours)
             duration_min = hours * 60.0
         else:
-            distance_km = self.fare.calculate_distance_km(
-                data.pickup_lat, data.pickup_lng, data.dropoff_lat, data.dropoff_lng
+            distance_km, duration_min = self.fare.resolve_trip_metrics(
+                data.pickup_lat,
+                data.pickup_lng,
+                data.dropoff_lat,
+                data.dropoff_lng,
+                distance_km=data.distance_km,
+                duration_min=data.duration_min,
             )
-            duration_min = self.fare.estimate_duration_min(distance_km)
         rule = await self.fare.get_pricing_rule(data.vehicle_type_id)
         fare = await self.fare.calculate_fare(
             vehicle_type,

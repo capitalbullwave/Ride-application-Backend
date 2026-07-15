@@ -21,6 +21,7 @@ from app.core.security import decode_token
 from app.middleware.error_handlers import register_exception_handlers
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.security import SecurityHeadersMiddleware
+import app.core.public_ids  # noqa: F401 — register BWR public ID generators
 
 setup_logging()
 logger = get_logger(__name__)
@@ -56,17 +57,6 @@ async def lifespan(app: FastAPI):
     app.openapi_schema = None
     logger.info("application_starting", env=settings.app_env, version="2.0.0")
     try:
-        from app.bootstrap.default_data import ensure_default_vehicle_types
-        from app.database.session import AsyncSessionLocal
-
-        async with AsyncSessionLocal() as db:
-            added = await ensure_default_vehicle_types(db)
-            await db.commit()
-            if added:
-                logger.info("bootstrap_vehicle_types_seeded", count=added)
-    except Exception as exc:
-        logger.warning("bootstrap_vehicle_types_skipped", error=str(exc))
-    try:
         from app.core.firebase import initialize_firebase
 
         initialize_firebase()
@@ -92,17 +82,15 @@ def create_app() -> FastAPI:
     application.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     register_exception_handlers(application)
 
-    cors_regex_parts = [
-        r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-        r"https://(www\.)?bullwaverides\.in",
-    ]
     cors_kwargs: dict = {
         "allow_credentials": True,
         "allow_methods": ["*"],
         "allow_headers": ["*"],
-        "allow_origin_regex": "|".join(cors_regex_parts),
-        "allow_origins": settings.all_cors_origins,
+        # Flutter web dev servers use random localhost ports — always allow them.
+        "allow_origin_regex": r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     }
+    if not settings.is_development:
+        cors_kwargs["allow_origins"] = settings.cors_origins_list
 
     application.add_middleware(CORSMiddleware, **cors_kwargs)
     application.add_middleware(SecurityHeadersMiddleware)

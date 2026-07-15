@@ -114,6 +114,7 @@ class UserUpdate(BaseModel):
     profile_photo: Optional[str] = None
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
+    gender: Optional[str] = None
     fcm_token: Optional[str] = None
 
 
@@ -129,6 +130,7 @@ class UserResponse(BaseSchema):
     is_verified: bool
     emergency_contact_name: Optional[str] = None
     emergency_contact_phone: Optional[str] = None
+    gender: Optional[str] = None
     created_at: datetime
 
 

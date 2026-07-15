@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,3 +45,40 @@ class ReferralCode(UUIDMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     user: Mapped["User"] = relationship("User", back_populates="referral_codes")
+
+
+class ReferralProgram(UUIDMixin, TimestampMixin, Base):
+    """Admin-managed Refer & Earn rules (one row per audience)."""
+
+    __tablename__ = "referral_programs"
+    __table_args__ = (UniqueConstraint("audience", name="uq_referral_programs_audience"),)
+
+    audience: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # USER | DRIVER
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    required_rides: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    reward_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    title: Mapped[str] = mapped_column(String(120), nullable=False, default="Refer & Earn")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    terms: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    share_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ReferralReward(UUIDMixin, TimestampMixin, Base):
+    """Tracks a referrer → referee relationship and payout progress."""
+
+    __tablename__ = "referral_rewards"
+    __table_args__ = (
+        UniqueConstraint("audience", "referee_id", name="uq_referral_rewards_audience_referee"),
+    )
+
+    audience: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # USER | DRIVER
+    program_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("referral_programs.id", ondelete="SET NULL"), nullable=True
+    )
+    referrer_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    referee_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    required_rides: Mapped[int] = mapped_column(Integer, nullable=False)
+    reward_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    rides_completed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False, index=True)
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

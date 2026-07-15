@@ -30,6 +30,7 @@ class Driver(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     phone: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
+    public_id: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     first_name: Mapped[str] = mapped_column(String(100), nullable=False)
     last_name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -38,6 +39,7 @@ class Driver(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     date_of_birth: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     gender: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     referral_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    invite_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, nullable=True, index=True)
     address_line: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -139,6 +141,7 @@ class DriverBankAccount(UUIDMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("drivers.id", ondelete="CASCADE"), nullable=False, index=True
     )
     account_holder_name: Mapped[str] = mapped_column(String(150), nullable=False)
+    account_number: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     account_number_masked: Mapped[str] = mapped_column(String(30), nullable=False)
     ifsc_code: Mapped[str] = mapped_column(String(20), nullable=False)
     bank_name: Mapped[str] = mapped_column(String(100), nullable=False)

@@ -35,12 +35,8 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
 
-    # CORS (comma-separated origins; www/non-www auto-expanded in cors_origins_list)
-    admin_panel_url: str = "https://bullwaverides.in"
-    cors_origins: str = (
-        "http://localhost:3000,http://localhost:3001,http://localhost:3002,"
-        "https://bullwaverides.in,https://www.bullwaverides.in"
-    )
+    # CORS
+    cors_origins: str = "http://localhost:3000,http://localhost:3001,http://localhost:3002"
 
     # Google Maps
     google_maps_api_key: str = ""
@@ -72,17 +68,14 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from: str = "noreply@ridebooking.com"
 
-    # Stripe
+    # Stripe (optional international cards)
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
 
-    # Razorpay
-    razorpay_key_id: str = ""
-    razorpay_key_secret: str = ""
-
-    # Cashfree
+    # Cashfree (ride UPI QR, wallet top-up, subscriptions)
     cashfree_app_id: str = ""
     cashfree_secret_key: str = ""
+    cashfree_env: str = "sandbox"  # sandbox | production
 
     # PhonePe
     phonepe_merchant_id: str = ""
@@ -107,55 +100,9 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_json: bool = False
 
-    @staticmethod
-    def _normalize_origin(origin: str) -> str:
-        origin = origin.strip().rstrip("/")
-        if not origin:
-            return ""
-        if not origin.startswith(("http://", "https://")):
-            origin = f"https://{origin}"
-        return origin
-
-    @property
-    def admin_panel_origins(self) -> List[str]:
-        """Always allow the production admin panel (https://bullwaverides.in)."""
-        origins: List[str] = []
-        for raw in (self.admin_panel_url, "https://www.bullwaverides.in"):
-            origin = self._normalize_origin(raw)
-            if not origin:
-                continue
-            origins.append(origin)
-            if origin.startswith("https://www."):
-                origins.append(origin.replace("https://www.", "https://", 1))
-            elif origin.startswith("https://"):
-                host = origin[len("https://") :]
-                if "localhost" not in host and "127.0.0.1" not in host:
-                    origins.append(f"https://www.{host}")
-        return list(dict.fromkeys(origins))
-
     @property
     def cors_origins_list(self) -> List[str]:
-        origins: List[str] = []
-        for raw in self.cors_origins.split(","):
-            origin = self._normalize_origin(raw)
-            if not origin:
-                continue
-            origins.append(origin)
-            if origin.startswith("https://www."):
-                origins.append(origin.replace("https://www.", "https://", 1))
-            elif origin.startswith("https://") and "localhost" not in origin and "127.0.0.1" not in origin:
-                host = origin[len("https://") :]
-                origins.append(f"https://www.{host}")
-            elif origin.startswith("http://www."):
-                origins.append(origin.replace("http://www.", "http://", 1))
-            elif origin.startswith("http://") and "localhost" not in origin and "127.0.0.1" not in origin:
-                host = origin[len("http://") :]
-                origins.append(f"http://www.{host}")
-        return list(dict.fromkeys(origins))
-
-    @property
-    def all_cors_origins(self) -> List[str]:
-        return list(dict.fromkeys(self.cors_origins_list + self.admin_panel_origins))
+        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     @property
     def is_production(self) -> bool:

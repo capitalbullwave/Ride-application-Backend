@@ -1,7 +1,6 @@
-"""Razorpay checkout for paid subscription plans."""
+"""Cashfree checkout for paid subscription plans."""
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -9,10 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.config import Settings
 from app.core.exceptions import NotFoundException, ValidationException
 from app.models import User
-from app.services.payment_service import _razorpay_client
+from app.services.cashfree_client import (
+    checkout_payload,
+    create_order,
+    ensure_order_paid,
+    make_order_id,
+)
 from app.services.user_benefits_service import map_subscription_plan
 from app.subscriptions.models import SubscriptionPayment, SubscriptionPlan, UserSubscription
 
@@ -69,72 +72,54 @@ class SubscriptionPaymentService:
         if plan.price <= 0:
             raise ValidationException("Free plan does not require payment")
 
-        amount_paise = max(int(round(plan.price * 100)), 100)
-        receipt = f"sub_{str(user.id).replace('-', '')[:12]}_{int(datetime.now(timezone.utc).timestamp())}"[
-            :40
-        ]
-
-        def _create_order() -> dict:
-            client = _razorpay_client()
-            return client.order.create(
-                {
-                    "amount": amount_paise,
-                    "currency": "INR",
-                    "receipt": receipt,
-                    "notes": {
-                        "user_id": str(user.id),
-                        "plan_slug": plan.slug,
-                        "plan_id": str(plan.id),
-                    },
-                }
-            )
-
-        order = await asyncio.to_thread(_create_order)
-        order_id = order.get("id")
-        if not order_id:
-            raise ValidationException("Unable to create Razorpay order")
+        order_id = make_order_id("sub", f"{user.id}{plan.slug}")
+        order = await create_order(
+            order_id=order_id,
+            amount=plan.price,
+            customer_id=str(user.id),
+            customer_phone_value=user.phone,
+            customer_email=user.email or "",
+            customer_name=f"{user.first_name} {user.last_name}".strip() or "User",
+            order_note=f"Subscription {plan.slug}",
+            order_tags={
+                "user_id": str(user.id),
+                "plan_slug": plan.slug,
+                "plan_id": str(plan.id),
+            },
+        )
 
         payment = SubscriptionPayment(
             user_id=user.id,
             plan_id=plan.id,
             amount=plan.price,
             currency="INR",
-            razorpay_order_id=str(order_id),
+            razorpay_order_id=order_id,  # stores Cashfree order_id
             status="PENDING",
+            gateway_response={
+                "provider": "cashfree",
+                "payment_session_id": order.get("payment_session_id"),
+            },
         )
         self.db.add(payment)
         await self.db.commit()
         await self.db.refresh(payment)
 
-        settings = Settings()
-        if not settings.razorpay_key_id.strip():
-            raise ValidationException("Razorpay is not configured on the server")
-
         return {
-            "checkout": {
-                "order_id": str(order_id),
-                "amount": amount_paise,
-                "currency": "INR",
-                "key_id": settings.razorpay_key_id.strip(),
-                "razorpay_key_id": settings.razorpay_key_id.strip(),
-                "plan": map_subscription_plan(plan),
-                "prefill": {
+            "checkout": checkout_payload(
+                order_id=order_id,
+                payment_session_id=str(order["payment_session_id"]),
+                amount_inr=plan.price,
+                description=plan.name,
+                prefill={
                     "name": f"{user.first_name} {user.last_name}".strip() or "User",
                     "email": user.email,
                     "contact": user.phone,
                 },
-            }
+                extra={"plan": map_subscription_plan(plan)},
+            )
         }
 
-    async def verify_and_activate(
-        self,
-        user: User,
-        *,
-        plan_slug: str,
-        razorpay_order_id: str,
-        razorpay_payment_id: str,
-        razorpay_signature: str,
-    ) -> dict:
+    async def verify_and_activate(self, user: User, *, plan_slug: str, order_id: str) -> dict:
         plan = await _get_active_plan(self.db, plan_slug)
         if plan.price <= 0:
             raise ValidationException("Free plan does not require payment verification")
@@ -144,7 +129,7 @@ class SubscriptionPaymentService:
             .options(selectinload(SubscriptionPayment.plan))
             .where(
                 SubscriptionPayment.user_id == user.id,
-                SubscriptionPayment.razorpay_order_id == razorpay_order_id,
+                SubscriptionPayment.razorpay_order_id == order_id,
                 SubscriptionPayment.plan_id == plan.id,
             )
             .order_by(SubscriptionPayment.created_at.desc())
@@ -161,29 +146,23 @@ class SubscriptionPaymentService:
                 return self._success_payload(sub, plan, "Subscription already active")
             raise ValidationException("Payment already processed but subscription missing")
 
-        def _verify() -> None:
-            client = _razorpay_client()
-            client.utility.verify_payment_signature(
-                {
-                    "razorpay_order_id": razorpay_order_id,
-                    "razorpay_payment_id": razorpay_payment_id,
-                    "razorpay_signature": razorpay_signature,
-                }
-            )
-
         try:
-            await asyncio.to_thread(_verify)
+            order = await ensure_order_paid(order_id)
         except Exception as exc:
             payment.status = "FAILED"
-            payment.gateway_response = {"error": str(exc)}
+            payment.gateway_response = {
+                **(payment.gateway_response or {}),
+                "error": str(exc),
+            }
             await self.db.commit()
             raise ValidationException("Payment verification failed") from exc
 
         payment.status = "COMPLETED"
-        payment.razorpay_payment_id = razorpay_payment_id
+        payment.razorpay_payment_id = str(order.get("cf_order_id") or order_id)
         payment.gateway_response = {
-            "razorpay_order_id": razorpay_order_id,
-            "razorpay_payment_id": razorpay_payment_id,
+            "provider": "cashfree",
+            "order_id": order_id,
+            "order": order,
         }
 
         sub = await activate_user_subscription(self.db, user.id, plan)

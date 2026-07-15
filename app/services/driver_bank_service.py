@@ -10,21 +10,42 @@ from app.drivers.models import DriverBankAccount
 from app.schemas.driver import DriverBankResponse, DriverBankUpsert
 
 
+def _digits_only(account_number: str) -> str:
+    return re.sub(r"\D", "", account_number or "")
+
+
 def _mask_account_number(account_number: str) -> str:
-    digits = re.sub(r"\D", "", account_number)
+    digits = _digits_only(account_number)
     if len(digits) >= 4:
         return f"****{digits[-4:]}"
     return "****"
 
 
 def bank_to_response(bank: DriverBankAccount) -> DriverBankResponse:
+    """Driver-facing response — always masked."""
+    full = (bank.account_number or "").strip()
+    masked = _mask_account_number(full) if full else bank.account_number_masked
     return DriverBankResponse(
         account_holder=bank.account_holder_name,
-        account_number=bank.account_number_masked,
+        account_number=masked,
         ifsc=bank.ifsc_code,
         bank_name=bank.bank_name,
         upi_id=bank.upi_id,
     )
+
+
+def bank_to_admin_dict(bank: DriverBankAccount) -> dict:
+    """Admin-facing bank details — full account number when stored."""
+    full = (bank.account_number or "").strip()
+    return {
+        "accountHolder": bank.account_holder_name,
+        "accountNumber": full or bank.account_number_masked,
+        "ifsc": bank.ifsc_code,
+        "bankName": bank.bank_name,
+        "upiId": bank.upi_id or "",
+        "isVerified": bank.is_verified,
+        "isMasked": not bool(full),
+    }
 
 
 class DriverBankService:
@@ -55,6 +76,7 @@ class DriverBankService:
             bank = DriverBankAccount(
                 driver_id=driver_id,
                 account_holder_name=data.account_holder_name.strip(),
+                account_number=None,
                 account_number_masked=masked,
                 ifsc_code="UPI0000000",
                 bank_name="UPI",
@@ -64,10 +86,12 @@ class DriverBankService:
         else:
             if not data.account_number or not data.ifsc_code or not data.bank_name:
                 raise ValidationException("Bank account details are incomplete")
+            full = _digits_only(data.account_number)
             bank = DriverBankAccount(
                 driver_id=driver_id,
                 account_holder_name=data.account_holder_name.strip(),
-                account_number_masked=_mask_account_number(data.account_number),
+                account_number=full,
+                account_number_masked=_mask_account_number(full),
                 ifsc_code=data.ifsc_code.strip().upper(),
                 bank_name=data.bank_name.strip(),
                 upi_id=data.upi_id.strip() if data.upi_id else None,

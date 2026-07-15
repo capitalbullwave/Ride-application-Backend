@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,9 +16,13 @@ if TYPE_CHECKING:
 
 class VehicleType(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "vehicle_types"
+    __table_args__ = (
+        UniqueConstraint("service_group", "name", name="uq_vehicle_types_service_group_name"),
+        UniqueConstraint("service_group", "slug", name="uq_vehicle_types_service_group_slug"),
+    )
 
-    name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
-    slug: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(50), nullable=False)
+    slug: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     icon: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     base_fare: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
@@ -32,6 +36,7 @@ class VehicleType(UUIDMixin, TimestampMixin, Base):
     cancellation_charge: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
     service_group: Mapped[str] = mapped_column(String(20), default="ride", nullable=False, index=True)
     capacity: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     driver_commission_percentage: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 

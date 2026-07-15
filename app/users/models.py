@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from app.ratings.models import Rating
     from app.rides.models import Ride
     from app.support.models import SupportTicket
-    from app.wallet.models import Wallet
+    from app.wallet.models import UserBankAccount, Wallet, WithdrawalRequest
 
 
 class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -28,6 +28,7 @@ class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     phone: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
+    public_id: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     first_name: Mapped[str] = mapped_column(String(100), nullable=False)
     last_name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -39,6 +40,7 @@ class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     otp_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     emergency_contact_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     emergency_contact_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    gender: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     fcm_token: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     device_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     device_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -54,6 +56,12 @@ class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     rides: Mapped[List["Ride"]] = relationship("Ride", back_populates="user", foreign_keys="Ride.user_id")
     wallet: Mapped[Optional["Wallet"]] = relationship("Wallet", back_populates="user", uselist=False)
+    bank_accounts: Mapped[List["UserBankAccount"]] = relationship(
+        "UserBankAccount", back_populates="user"
+    )
+    withdrawals: Mapped[List["WithdrawalRequest"]] = relationship(
+        "WithdrawalRequest", back_populates="user"
+    )
     saved_addresses: Mapped[List["SavedAddress"]] = relationship("SavedAddress", back_populates="user")
     ratings_given: Mapped[List["Rating"]] = relationship(
         "Rating", back_populates="user", foreign_keys="Rating.user_id"

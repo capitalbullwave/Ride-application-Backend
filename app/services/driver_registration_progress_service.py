@@ -390,6 +390,19 @@ class DriverRegistrationProgressService:
         stored = persist_driver_image(data.profile_photo, str(driver.id), "selfie")
         if stored:
             driver.profile_photo = stored
+
+        # Best-effort: apply optional referral from welcome / signup (progressive flow)
+        if data.referral_code and str(data.referral_code).strip():
+            from app.core.exceptions import AppException
+            from app.services.referral_service import ReferralService
+
+            try:
+                await ReferralService(self.db).apply_driver_referral(
+                    driver, data.referral_code.strip()
+                )
+            except AppException:
+                pass
+
         await self.driver_repo.update(driver)
         return {"message": "Profile saved", "profile_photo": driver.profile_photo}
 
