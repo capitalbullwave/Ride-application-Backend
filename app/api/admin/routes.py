@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.admin._core import router as core_router
 from app.api.admin._extended import router as extended_router
+from app.api.admin.corporate_routes import router as corporate_router
 from app.auth.dependencies import get_current_admin
 from app.core.constants import KYCStatus
 from app.core.exceptions import NotFoundException
@@ -18,6 +19,7 @@ from sqlalchemy import select
 router = APIRouter(tags=["Admin"])
 router.include_router(core_router)
 router.include_router(extended_router)
+router.include_router(corporate_router)
 
 
 class ApproveDriverRequest(BaseModel):

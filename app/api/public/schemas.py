@@ -33,6 +33,7 @@ class DirectionsResponse(BaseModel):
     duration_min: float
     path: list[LatLngPoint]
     source: str = Field(description="google or osrm")
+    stops: list[RoutePoint] = Field(default_factory=list)
 
 
 class ReverseGeocodeResponse(BaseModel):
@@ -49,3 +50,17 @@ class PlaceDetailsResponse(BaseModel):
     latitude: float
     longitude: float
     source: str = Field(description="google or nominatim")
+
+
+class AiChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., min_length=1, max_length=1200)
+
+
+class AiChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1200)
+    history: list[AiChatMessage] = Field(default_factory=list, max_length=8)
+
+
+class AiChatResponse(BaseModel):
+    reply: str

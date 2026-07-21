@@ -1,13 +1,17 @@
 """Application configuration — single source of truth for all environment variables."""
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Always load Backend/.env (not dependent on process cwd)
+_BACKEND_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_BACKEND_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -56,10 +60,9 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""
     twilio_phone_number: str = ""  # optional; Verify API does not require it
-    # OTP delivery: auto | twilio | local
-    # - auto/twilio: send real SMS via Twilio to the entered phone number
-    # - local: only for emergency offline testing (hardcoded 123456, no SMS)
-    otp_delivery_mode: str = "auto"
+    # TWILIO_ENABLED=true  → send real SMS OTP via Twilio (user + driver)
+    # TWILIO_ENABLED=false → no SMS; verify with hardcoded OTP 123456
+    twilio_enabled: bool = False
 
     # Email
     smtp_host: str = "smtp.gmail.com"
@@ -76,6 +79,10 @@ class Settings(BaseSettings):
     cashfree_app_id: str = ""
     cashfree_secret_key: str = ""
     cashfree_env: str = "sandbox"  # sandbox | production
+
+    # OpenAI (User Panel AI assistant)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
 
     # PhonePe
     phonepe_merchant_id: str = ""
@@ -99,6 +106,22 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_json: bool = False
+
+    # Driver selfie verification (shift gate)
+    face_provider: str = "mock"  # mock | aws_rekognition | azure_face | facepp | insightface | deepface
+    liveness_provider: str = "instant_capture"  # instant_capture | mock | client_challenge | aws_rekognition | azure_face
+    face_match_threshold: float = 80.0
+    selfie_max_failed_attempts: int = 10
+    selfie_lockout_minutes: int = 5
+    selfie_verification_ttl_minutes: int = 10
+    shift_max_hours: int = 16
+    selfie_encrypt_at_rest: bool = True
+    # Provider credentials (optional — mock works without these)
+    aws_rekognition_collection_id: str = ""
+    azure_face_endpoint: str = ""
+    azure_face_key: str = ""
+    facepp_api_key: str = ""
+    facepp_api_secret: str = ""
 
     @property
     def cors_origins_list(self) -> List[str]:

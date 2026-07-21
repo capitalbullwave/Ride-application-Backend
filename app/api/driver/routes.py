@@ -55,8 +55,10 @@ logger = get_logger(__name__)
 from app.services.payment_service import PaymentService, WalletService
 from app.services.ride_service import RideService
 from app.api.websocket.manager import manager
+from app.api.driver.selfie_routes import router as selfie_router
 
 router = APIRouter(tags=["Driver"])
+router.include_router(selfie_router)
 
 
 def _driver_active_ride_payload(ride: Ride) -> dict:
@@ -65,9 +67,18 @@ def _driver_active_ride_payload(ride: Ride) -> dict:
     payload["dropoff_address"] = ride.dropoff_address
     payload["payment_method"] = ride.payment_method
     payload["estimated_distance_km"] = ride.estimated_distance_km
+    payload["stops"] = list(ride.stops or [])
+    payload["ride_type"] = getattr(ride, "ride_type", "NORMAL") or "NORMAL"
+    payload["payment_source"] = getattr(ride, "payment_source", "USER") or "USER"
+    payload["is_corporate"] = payload["ride_type"] == "CORPORATE"
     if ride.user:
         payload["passenger_name"] = f"{ride.user.first_name} {ride.user.last_name}".strip() or "Passenger"
         payload["passenger_phone"] = ride.user.phone
+    company = getattr(ride, "company", None)
+    if company is not None:
+        payload["company_name"] = company.company_name
+    elif getattr(ride, "company_id", None):
+        payload["company_name"] = None
     return payload
 
 
@@ -80,6 +91,7 @@ async def _load_driver_ride(db: AsyncSession, ride_id: UUID) -> Ride:
             selectinload(Ride.user),
             selectinload(Ride.vehicle),
             selectinload(Ride.vehicle_type),
+            selectinload(Ride.company),
         )
         .where(Ride.id == ride_id)
     )
@@ -89,16 +101,40 @@ async def _load_driver_ride(db: AsyncSession, ride_id: UUID) -> Ride:
 def _payment_breakdown_payload(ride: Ride, payment_method: str | None = None) -> dict:
     fare = float(ride.final_fare or ride.estimated_fare or 0)
     commission_pct = float(ride.driver_commission_percentage or 0)
-    driver_earning = float(ride.driver_earning or 0)
-    company_earning = float(ride.company_earning or 0)
+    driver_earning = ride.driver_earning
+    company_earning = ride.company_earning
+
+    # Backfill display values when settlement fields were never written.
+    if fare > 0 and (driver_earning is None or company_earning is None):
+        from app.services.ride_settlement_service import compute_ride_split
+        from app.services.commission_service import CommissionService
+
+        pct = commission_pct if commission_pct > 0 else CommissionService.DEFAULT_COMMISSION_PERCENTAGE
+        driver_earning, company_earning = compute_ride_split(fare, pct)
+        commission_pct = pct
+    else:
+        driver_earning = float(driver_earning or 0)
+        company_earning = float(company_earning or 0)
+        # Inconsistent 0/0 with a positive fare — derive from percentage.
+        if fare > 0 and driver_earning <= 0 and company_earning <= 0:
+            from app.services.ride_settlement_service import compute_ride_split
+            from app.services.commission_service import CommissionService
+
+            pct = commission_pct if commission_pct > 0 else CommissionService.DEFAULT_COMMISSION_PERCENTAGE
+            driver_earning, company_earning = compute_ride_split(fare, pct)
+            commission_pct = pct
+
     return {
-        "trip_fare": fare,
-        "commission": company_earning,
-        "commission_percentage": commission_pct,
+        "trip_fare": round(fare, 2),
+        "commission": round(company_earning, 2),
+        "commission_percentage": round(commission_pct, 2),
+        "platform_commission_percentage": round(max(0.0, 100.0 - commission_pct), 2),
+        "driver_earning": round(driver_earning, 2),
+        "company_earning": round(company_earning, 2),
         "bonus": 0.0,
-        "total_earnings": driver_earning,
+        "total_earnings": round(driver_earning, 2),
         "payment_mode": payment_method or ride.payment_method or "CASH",
-        "final_fare": fare,
+        "final_fare": round(fare, 2),
         "estimated_fare": ride.estimated_fare,
         "payment_method": payment_method or ride.payment_method or "CASH",
     }
@@ -106,7 +142,7 @@ def _payment_breakdown_payload(ride: Ride, payment_method: str | None = None) ->
 
 async def _ensure_ride_settled(db: AsyncSession, ride: Ride) -> Ride:
     """Idempotent settlement if ride completed before settlement ran."""
-    if ride.driver_earning is not None:
+    if ride.driver_earning is not None and ride.company_earning is not None:
         return ride
     from app.services.ride_settlement_service import RideSettlementService
 
@@ -137,6 +173,35 @@ class CollectPaymentRequest(BaseModel):
     method: str = Field(..., pattern="^(CASH|CASHFREE|UPI)$")
 
 
+def _is_placeholder_driver_email(email: str | None, phone: str | None) -> bool:
+    """True for auto-generated phone@driver.ridebook.app / phone@ridebook.app emails."""
+    if not email:
+        return True
+    value = email.strip().lower()
+    if not value.endswith("@ridebook.app"):
+        return False
+    local = value.split("@", 1)[0]
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    local_digits = "".join(ch for ch in local if ch.isdigit())
+    return bool(local_digits and digits and local_digits in digits)
+
+
+def _driver_placeholder_email(phone: str) -> str:
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    return f"{digits or 'driver'}@driver.ridebook.app"
+
+
+def _profile_response(driver: Driver, *, total_rides: int | None = None) -> DriverResponse:
+    response = DriverResponse.model_validate(driver)
+    updates: dict = {}
+    if total_rides is not None:
+        updates["total_rides"] = total_rides
+    # Never expose system placeholder emails in the driver app.
+    if _is_placeholder_driver_email(response.email, driver.phone):
+        updates["email"] = ""
+    return response.model_copy(update=updates) if updates else response
+
+
 @router.get("/profile", response_model=DriverResponse)
 async def get_profile(
     driver: Annotated[Driver, Depends(get_current_driver)],
@@ -145,9 +210,7 @@ async def get_profile(
     from app.services.driver_dashboard_service import DriverDashboardService
 
     completed_trips = await DriverDashboardService(db).count_completed_trips(driver.id)
-    return DriverResponse.model_validate(driver).model_copy(
-        update={"total_rides": completed_trips}
-    )
+    return _profile_response(driver, total_rides=completed_trips)
 
 
 @router.put("/profile", response_model=DriverResponse)
@@ -157,10 +220,26 @@ async def update_profile(
     db: AsyncSession = Depends(get_db),
 ):
     repo = DriverRepository(db)
-    for field, value in data.model_dump(exclude_unset=True).items():
+    updates = data.model_dump(exclude_unset=True)
+
+    if "email" in updates:
+        email = (updates.get("email") or "").strip().lower()
+        if not email:
+            # DB email is NOT NULL — restore phone-based placeholder when cleared.
+            updates["email"] = _driver_placeholder_email(driver.phone)
+        else:
+            existing = await repo.get_by_email(email)
+            if existing and existing.id != driver.id:
+                raise ValidationException("This email is already in use")
+            updates["email"] = email
+
+    if "first_name" in updates and updates["first_name"] == "":
+        raise ValidationException("Name is required")
+
+    for field, value in updates.items():
         setattr(driver, field, value)
     await repo.update(driver)
-    return DriverResponse.model_validate(driver)
+    return _profile_response(driver)
 
 
 @router.post("/upload-license")
@@ -297,24 +376,11 @@ async def complete_registration(
 
 @router.put("/go-online")
 async def go_online(driver: Annotated[Driver, Depends(get_current_driver)], db: AsyncSession = Depends(get_db)):
-    if driver.kyc_status != KYCStatus.APPROVED.value:
-        if driver.kyc_status == KYCStatus.REJECTED.value:
-            raise ForbiddenException(
-                "Your documents were rejected. Please update and resubmit before going online."
-            )
-        raise ForbiddenException(
-            "Account verification is pending. You can go online after admin approval."
-        )
-    if not driver.is_verified:
-        raise ForbiddenException(
-            "Phone verification is required before going online."
-        )
+    """Legacy PUT — requires prior selfie verification (same as POST /go-online)."""
+    from app.selfie_verification.service import DriverSelfieShiftService
 
-    driver.status = DriverStatus.ONLINE.value
-    await DriverRepository(db).update(driver)
+    result = await DriverSelfieShiftService(db).go_online(driver)
     matching = DriverMatchingService(db)
-    lat, lng = await matching.driver_default_location(driver.id)
-    await matching.ensure_driver_online(driver, lat, lng)
 
     # Immediately attach only PRESENT fresh searching rides (never past/stale).
     try:
@@ -332,6 +398,7 @@ async def go_online(driver: Annotated[Driver, Depends(get_current_driver)], db: 
                     "pickup_lng": ride.pickup_lng,
                     "dropoff_lat": ride.dropoff_lat,
                     "dropoff_lng": ride.dropoff_lng,
+                    "stops": list(ride.stops or []),
                     "estimated_fare": float(ride.estimated_fare or 0),
                     "estimated_distance_km": float(ride.estimated_distance_km or 0),
                     "estimated_duration_min": float(ride.estimated_duration_min or 0),
@@ -359,15 +426,18 @@ async def go_online(driver: Annotated[Driver, Depends(get_current_driver)], db: 
             error=str(exc),
         )
 
-    return {"status": driver.status}
+    return {"status": result.status, "shift": result.shift.model_dump(mode="json")}
 
 
 @router.put("/go-offline")
 async def go_offline(driver: Annotated[Driver, Depends(get_current_driver)], db: AsyncSession = Depends(get_db)):
-    driver.status = DriverStatus.OFFLINE.value
-    await DriverRepository(db).update(driver)
-    await DriverMatchingService(db).set_driver_offline(driver.id)
-    return {"status": driver.status}
+    from app.selfie_verification.service import DriverSelfieShiftService
+
+    result = await DriverSelfieShiftService(db).go_offline(driver)
+    return {
+        "status": result.status,
+        "shift": result.shift.model_dump(mode="json") if result.shift else None,
+    }
 
 
 @router.post("/location")
@@ -456,6 +526,7 @@ async def ride_requests(driver: Annotated[Driver, Depends(get_current_driver)], 
             "pickup_lng": r.pickup_lng,
             "dropoff_lat": r.dropoff_lat,
             "dropoff_lng": r.dropoff_lng,
+            "stops": list(r.stops or []),
             "estimated_fare": r.estimated_fare,
             "estimated_distance_km": r.estimated_distance_km,
             "estimated_duration_min": r.estimated_duration_min,
@@ -481,10 +552,27 @@ async def accept_ride(
 
     from app.models import Vehicle
     from app.notifications.service import NotificationService
+    from app.selfie_verification.service import DriverSelfieShiftService
+
+    # Block ride acceptance without an active selfie-verified shift.
+    await DriverSelfieShiftService(db).assert_can_accept_rides(driver)
 
     matching = DriverMatchingService(db)
     vehicle_id = data.vehicle_id
     vehicle = None
+
+    # Block non-women captains from women-preferred searches.
+    from app.services.women_rider_preference import (
+        is_female_gender,
+        ride_requires_women_captains,
+    )
+
+    pending_ride = await RideService(db).get_ride(data.ride_id)
+    if ride_requires_women_captains(pending_ride) and not is_female_gender(driver.gender):
+        raise ValidationException(
+            "This ride is reserved for women captains. Please wait for other requests."
+        )
+
     if vehicle_id is None:
         vehicle_result = await db.execute(
             select(Vehicle).where(
@@ -528,6 +616,8 @@ async def accept_ride(
         "driver_id": str(driver.id),
         "driver_name": driver_name,
         "driver_phone": driver.phone,
+        "driver_rating": float(getattr(driver, "rating_avg", 0) or 0),
+        "driver_photo_url": getattr(driver, "profile_photo", None),
         "vehicle_number": vehicle.license_plate if vehicle else None,
         "start_code": ride.ride_otp,
         "status": ride.status,
@@ -537,6 +627,7 @@ async def accept_ride(
         "pickup_lng": ride.pickup_lng,
         "dropoff_lat": ride.dropoff_lat,
         "dropoff_lng": ride.dropoff_lng,
+        "stops": list(ride.stops or []),
         "estimated_fare": ride.estimated_fare,
     }
     if ride.vehicle_type:
@@ -698,6 +789,30 @@ async def collect_payment(
                 "success": True,
                 "payment_status": PaymentStatus.COMPLETED.value,
                 "payment_collected": True,
+            }
+        )
+        return payload
+
+    # Corporate rides are billed to the company — skip passenger collection
+    if (
+        getattr(ride, "payment_source", None) == "COMPANY"
+        or getattr(ride, "ride_type", None) == "CORPORATE"
+        or (ride.payment_method or "").upper() == "COMPANY"
+    ):
+        payment = await payment_service.process_payment(
+            ride.id, ride.user_id, fare, PaymentMethod.COMPANY.value
+        )
+        ride.payment_method = PaymentMethod.COMPANY.value
+        await db.flush()
+        ride = await _ensure_ride_settled(db, ride)
+        await db.commit()
+        payload = _payment_breakdown_payload(ride, PaymentMethod.COMPANY.value)
+        payload.update(
+            {
+                "success": True,
+                "payment_status": payment.status,
+                "payment_collected": True,
+                "paid_by_company": True,
             }
         )
         return payload
@@ -1198,6 +1313,61 @@ async def ride_history(
         "page_size": page_size,
         "total_pages": max(1, (total + page_size - 1) // page_size),
     }
+
+
+@router.get("/rides/{ride_id}/summary")
+async def ride_summary(
+    ride_id: UUID,
+    driver: Annotated[Driver, Depends(get_current_driver)],
+    db: AsyncSession = Depends(get_db),
+):
+    """Completed-ride summary for the captain (distance, duration, fare split, stops)."""
+    ride = await RideService(db).get_ride(ride_id)
+    if ride.driver_id != driver.id:
+        raise ForbiddenException("Access denied")
+
+    ride = await _ensure_ride_settled(db, ride)
+
+    distance_km = float(
+        ride.actual_distance_km
+        if ride.actual_distance_km is not None
+        else (ride.estimated_distance_km or 0)
+    )
+    duration_min = float(
+        ride.actual_duration_min
+        if ride.actual_duration_min is not None
+        else (ride.estimated_duration_min or 0)
+    )
+    if duration_min <= 0 and ride.started_at and ride.completed_at:
+        duration_min = max(
+            0.0,
+            (ride.completed_at - ride.started_at).total_seconds() / 60.0,
+        )
+
+    payload = {
+        "id": str(ride.id),
+        "public_id": ride.public_id,
+        "pickup_address": ride.pickup_address,
+        "dropoff_address": ride.dropoff_address,
+        "destination_address": ride.dropoff_address,
+        "stops": list(ride.stops or []),
+        "estimated_distance_km": round(distance_km, 2),
+        "actual_distance_km": (
+            round(float(ride.actual_distance_km), 2)
+            if ride.actual_distance_km is not None
+            else None
+        ),
+        "estimated_duration_min": round(duration_min, 2),
+        "actual_duration_min": (
+            round(float(ride.actual_duration_min), 2)
+            if ride.actual_duration_min is not None
+            else None
+        ),
+        "status": ride.status,
+        "completed_at": ride.completed_at.isoformat() if ride.completed_at else None,
+    }
+    payload.update(_payment_breakdown_payload(ride))
+    return payload
 
 
 class ArrivedRideRequest(BaseModel):

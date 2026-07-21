@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from app.vehicles.models import Vehicle
     from app.commission.models import DriverWallet
     from app.wallet.models import Wallet, WithdrawalRequest
+    from app.selfie_verification.models import DriverSelfieLog, DriverShift
 
 
 class Driver(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
@@ -82,6 +83,15 @@ class Driver(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     support_tickets: Mapped[List["SupportTicket"]] = relationship("SupportTicket", back_populates="driver")
     emergency_contacts: Mapped[List["DriverEmergencyContact"]] = relationship(
         "DriverEmergencyContact", back_populates="driver", cascade="all, delete-orphan"
+    )
+    shifts: Mapped[List["DriverShift"]] = relationship(
+        "DriverShift", back_populates="driver", cascade="all, delete-orphan"
+    )
+    selfie_logs: Mapped[List["DriverSelfieLog"]] = relationship(
+        "DriverSelfieLog",
+        back_populates="driver",
+        cascade="all, delete-orphan",
+        foreign_keys="DriverSelfieLog.driver_id",
     )
 
 

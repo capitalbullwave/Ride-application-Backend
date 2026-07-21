@@ -45,6 +45,23 @@ class CashGateway(PaymentGateway):
         return {"status": "refunded", "amount": amount}
 
 
+class CompanyGateway(PaymentGateway):
+    """Corporate rides billed to the company — no user collection."""
+
+    async def create_payment(self, amount: float, currency: str, metadata: dict) -> dict:
+        return {
+            "status": "completed",
+            "transaction_id": f"company_{metadata.get('ride_id')}",
+            "paid_by": "COMPANY",
+        }
+
+    async def verify_payment(self, transaction_id: str) -> dict:
+        return {"status": "completed", "transaction_id": transaction_id}
+
+    async def refund_payment(self, transaction_id: str, amount: float) -> dict:
+        return {"status": "refunded", "amount": amount}
+
+
 class WalletGateway(PaymentGateway):
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -381,6 +398,7 @@ class CashfreeGateway(PaymentGateway):
 class PaymentService:
     GATEWAYS = {
         PaymentMethod.CASH.value: CashGateway,
+        PaymentMethod.COMPANY.value: CompanyGateway,
         PaymentMethod.WALLET.value: WalletGateway,
         PaymentMethod.STRIPE.value: StripeGateway,
         PaymentMethod.UPI.value: CashfreeGateway,

@@ -7,6 +7,7 @@ from app.api.common.routes import router as common_router
 from app.api.driver.routes import router as driver_router
 from app.api.public.routes import router as public_router
 from app.api.user.routes import router as user_router
+from app.corporate.router import router as corporate_router
 from app.notifications.router import router as notifications_router
 from app.notifications.router import (
     update_driver_device_token,
@@ -22,6 +23,7 @@ api_router.include_router(user_router, prefix="/users", tags=["Users"])
 api_router.include_router(driver_router, prefix="/drivers", tags=["Drivers"])
 api_router.include_router(rides_router, prefix="/rides", tags=["Rides"])
 api_router.include_router(admin_router, prefix="/admin", tags=["Admin"])
+api_router.include_router(corporate_router, prefix="/corporate", tags=["Corporate"])
 api_router.include_router(common_router, prefix="/common", tags=["Common"])
 api_router.include_router(public_router, prefix="/public", tags=["Public"])
 api_router.include_router(notifications_router, prefix="/notifications", tags=["Notifications"])

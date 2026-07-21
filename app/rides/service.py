@@ -8,7 +8,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.constants import ActorType, RideEventType, RideStatus
+from app.core.constants import (
+    ActorType,
+    PaymentMethod,
+    PaymentSource,
+    RideEventType,
+    RideStatus,
+    RideType,
+)
 from app.core.exceptions import ForbiddenException, NotFoundException, ValidationException
 from app.core.security import generate_otp
 from app.maps.service import MapsService
@@ -61,8 +68,42 @@ class FareEngine:
         return geodesic((lat1, lng1), (lat2, lng2)).kilometers
 
     @staticmethod
+    def calculate_multi_leg_distance_km(
+        pickup_lat: float,
+        pickup_lng: float,
+        dropoff_lat: float,
+        dropoff_lng: float,
+        stops: Optional[list[tuple[float, float]]] = None,
+    ) -> float:
+        """Straight-line sum: pickup → stop1 → … → drop (fallback when maps unavailable)."""
+        points: list[tuple[float, float]] = [(pickup_lat, pickup_lng)]
+        for lat, lng in (stops or [])[:3]:
+            points.append((float(lat), float(lng)))
+        points.append((dropoff_lat, dropoff_lng))
+        total = 0.0
+        for i in range(len(points) - 1):
+            total += FareEngine.calculate_distance_km(
+                points[i][0], points[i][1], points[i + 1][0], points[i + 1][1]
+            )
+        return total
+
+    @staticmethod
     def estimate_duration_min(distance_km: float, avg_speed_kmh: float = 30.0) -> float:
         return (distance_km / avg_speed_kmh) * 60
+
+    @staticmethod
+    def _stop_coords_from_payload(stops) -> list[tuple[float, float]]:
+        coords: list[tuple[float, float]] = []
+        for stop in (stops or [])[:3]:
+            lat = getattr(stop, "lat", None)
+            lng = getattr(stop, "lng", None)
+            if lat is None and isinstance(stop, dict):
+                lat = stop.get("lat")
+                lng = stop.get("lng")
+            if lat is None or lng is None:
+                continue
+            coords.append((float(lat), float(lng)))
+        return coords
 
     @staticmethod
     def resolve_trip_metrics(
@@ -73,9 +114,24 @@ class FareEngine:
         *,
         distance_km: Optional[float] = None,
         duration_min: Optional[float] = None,
+        stops: Optional[list[tuple[float, float]]] = None,
     ) -> tuple[float, float]:
-        if distance_km is not None:
+        stop_coords = list(stops or [])[:3]
+        if distance_km is not None and not stop_coords:
             km = max(0.0, float(distance_km))
+            mins = (
+                max(0.0, float(duration_min))
+                if duration_min is not None
+                else FareEngine.estimate_duration_min(km)
+            )
+            return km, mins
+        if stop_coords:
+            km = FareEngine.calculate_multi_leg_distance_km(
+                pickup_lat, pickup_lng, dropoff_lat, dropoff_lng, stop_coords
+            )
+            # Prefer client road distance when it is at least the multi-leg floor.
+            if distance_km is not None and float(distance_km) >= km * 0.85:
+                km = max(0.0, float(distance_km))
             mins = (
                 max(0.0, float(duration_min))
                 if duration_min is not None
@@ -84,6 +140,64 @@ class FareEngine:
             return km, mins
         km = FareEngine.calculate_distance_km(pickup_lat, pickup_lng, dropoff_lat, dropoff_lng)
         return km, FareEngine.estimate_duration_min(km)
+
+    async def resolve_route_metrics(
+        self,
+        pickup_lat: float,
+        pickup_lng: float,
+        dropoff_lat: float,
+        dropoff_lng: float,
+        *,
+        distance_km: Optional[float] = None,
+        duration_min: Optional[float] = None,
+        stops=None,
+        maps: Optional[MapsService] = None,
+    ) -> tuple[float, float]:
+        """Prefer road distance via maps (pickup → stops → drop); fall back to multi-leg / client."""
+        stop_coords = self._stop_coords_from_payload(stops)
+
+        # Fast path: no stops + client already sent road distance from directions.
+        if not stop_coords and distance_km is not None:
+            return self.resolve_trip_metrics(
+                pickup_lat,
+                pickup_lng,
+                dropoff_lat,
+                dropoff_lng,
+                distance_km=distance_km,
+                duration_min=duration_min,
+            )
+
+        maps_client = maps or MapsService()
+        try:
+            routed = await maps_client.get_route_metrics_by_coords(
+                pickup_lat,
+                pickup_lng,
+                dropoff_lat,
+                dropoff_lng,
+                waypoints=stop_coords or None,
+            )
+        except Exception:
+            routed = None
+        if routed and routed.get("distance_km") is not None:
+            km = max(0.0, float(routed["distance_km"]))
+            mins = max(
+                0.0,
+                float(
+                    routed.get("duration_min")
+                    if routed.get("duration_min") is not None
+                    else self.estimate_duration_min(km)
+                ),
+            )
+            return km, mins
+        return self.resolve_trip_metrics(
+            pickup_lat,
+            pickup_lng,
+            dropoff_lat,
+            dropoff_lng,
+            distance_km=distance_km,
+            duration_min=duration_min,
+            stops=stop_coords,
+        )
 
     def is_night_time(self, dt: Optional[datetime] = None) -> bool:
         dt = dt or datetime.now(timezone.utc)
@@ -160,13 +274,14 @@ class FareEngine:
     async def estimate(
         self, data: RideEstimateRequest, user_id: Optional[UUID] = None
     ) -> RideEstimateResponse:
-        distance_km, duration_min = self.resolve_trip_metrics(
+        distance_km, duration_min = await self.resolve_route_metrics(
             data.pickup_lat,
             data.pickup_lng,
             data.dropoff_lat,
             data.dropoff_lng,
             distance_km=data.distance_km,
             duration_min=data.duration_min,
+            stops=data.stops,
         )
         service_group = (data.service_group or "ride").strip().lower()
         vehicle_types = await self.get_vehicle_types(service_group=service_group)
@@ -287,13 +402,15 @@ class RideService:
             hours = float(data.rental_hours) if data.rental_hours is not None else float(vehicle_type.included_hours)
             duration_min = hours * 60.0
         else:
-            distance_km, duration_min = self.fare.resolve_trip_metrics(
+            distance_km, duration_min = await self.fare.resolve_route_metrics(
                 data.pickup_lat,
                 data.pickup_lng,
                 data.dropoff_lat,
                 data.dropoff_lng,
                 distance_km=data.distance_km,
                 duration_min=data.duration_min,
+                stops=data.stops,
+                maps=self.maps,
             )
         rule = await self.fare.get_pricing_rule(data.vehicle_type_id)
         fare = await self.fare.calculate_fare(
@@ -325,9 +442,28 @@ class RideService:
             )
             fare["promo_discount"] = promo_discount
 
-        # Rental bookings are hour-based; don't block on external routing.
-        if (vehicle_type.service_group or "ride") != "rental":
-            await self.maps.get_route_between(data.pickup_address, data.dropoff_address)
+        ride_type = (data.ride_type or RideType.NORMAL.value).upper()
+        company_id = None
+        employee_id = None
+        payment_source = PaymentSource.USER.value
+        payment_method = data.payment_method
+
+        if ride_type == RideType.CORPORATE.value:
+            from app.corporate.repository import CorporateRepository
+            from app.corporate.validators import validate_corporate_booking
+
+            company, membership = await validate_corporate_booking(
+                CorporateRepository(self.db),
+                user_id=user_id,
+                company_id=data.company_id,
+                employee_id=data.employee_id,
+                vehicle_type_id=data.vehicle_type_id,
+                estimated_fare=float(fare["estimated_fare"]),
+            )
+            company_id = company.id
+            employee_id = membership.id
+            payment_source = PaymentSource.COMPANY.value
+            payment_method = PaymentMethod.COMPANY.value
 
         ride = Ride(
             user_id=user_id,
@@ -339,6 +475,11 @@ class RideService:
             dropoff_address=data.dropoff_address,
             dropoff_lat=data.dropoff_lat,
             dropoff_lng=data.dropoff_lng,
+            stops=(
+                [s.model_dump() for s in data.stops[:3]]
+                if data.stops
+                else None
+            ),
             estimated_distance_km=round(distance_km, 2),
             estimated_duration_min=round(duration_min, 2),
             estimated_fare=fare["estimated_fare"],
@@ -351,7 +492,11 @@ class RideService:
             platform_fee=fare["platform_fee"],
             promo_discount=fare.get("promo_discount", 0),
             promo_code_id=promo_code_id,
-            payment_method=data.payment_method,
+            payment_method=payment_method,
+            ride_type=ride_type,
+            company_id=company_id,
+            employee_id=employee_id,
+            payment_source=payment_source,
             ride_otp=generate_otp(4),
             scheduled_at=data.scheduled_at,
         )

@@ -87,41 +87,28 @@ class AuthService:
     _DEV_HARDCODED_OTP = "123456"
 
     def _use_twilio_otp(self) -> bool:
-        """Decide whether OTP should go through Twilio Verify (real SMS)."""
-        mode = (settings.otp_delivery_mode or "auto").strip().lower()
-        twilio_ready = self._twilio_otp().is_configured
-
-        if mode == "local":
+        """True when Backend/.env has TWILIO_ENABLED=true (real SMS for user + driver)."""
+        if not settings.twilio_enabled:
             return False
-        if mode == "twilio":
-            if not twilio_ready:
-                raise ValidationException(
-                    "OTP_DELIVERY_MODE=twilio but Twilio credentials are missing in .env."
-                )
-            return True
-
-        # auto: always send real SMS when Twilio is configured (any environment)
-        return twilio_ready
+        if not self._twilio_otp().is_configured:
+            raise ValidationException(
+                "TWILIO_ENABLED=true but Twilio credentials are missing in .env."
+            )
+        return True
 
     async def _issue_phone_otp(self, phone: str) -> str | None:
-        """Send OTP via Twilio Verify to the real phone number when configured."""
+        """Send OTP via Twilio when enabled; otherwise store hardcoded 123456 (no SMS)."""
         if self._use_twilio_otp():
             self._twilio_otp().send_otp(phone)
             return None
 
-        if settings.is_development or not settings.is_production:
-            logger.warning(
-                "dev_otp_hardcoded",
-                phone=phone[-4:] if phone else "",
-                otp=self._DEV_HARDCODED_OTP,
-                mode=settings.otp_delivery_mode,
-                hint="Twilio not configured / OTP_DELIVERY_MODE=local — using 123456.",
-            )
-            return self._DEV_HARDCODED_OTP
-
-        raise ValidationException(
-            "SMS OTP is not configured. Add Twilio credentials or contact support."
+        logger.warning(
+            "local_otp_hardcoded",
+            phone=phone[-4:] if phone else "",
+            otp=self._DEV_HARDCODED_OTP,
+            hint="TWILIO_ENABLED=false — using 123456, no SMS sent.",
         )
+        return self._DEV_HARDCODED_OTP
 
     def _validate_phone_otp(
         self,

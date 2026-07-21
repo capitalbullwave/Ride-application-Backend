@@ -164,11 +164,64 @@ class MapsService:
             "formatted_address": row["address"],
         }
 
-    async def get_route_between(self, pickup: str, dropoff: str) -> Optional[dict]:
+    async def get_route_metrics_by_coords(
+        self,
+        origin_lat: float,
+        origin_lng: float,
+        dest_lat: float,
+        dest_lng: float,
+        waypoints: Optional[list[tuple[float, float]]] = None,
+    ) -> Optional[dict]:
+        """Road distance/duration for pickup → optional stops → drop (coords only)."""
+        stop_coords = list(waypoints or [])[:3]
+        if self.api_key:
+            google_route = await self._google_directions_route(
+                origin_lat,
+                origin_lng,
+                dest_lat,
+                dest_lng,
+                waypoints=stop_coords or None,
+            )
+            if google_route:
+                return {
+                    "distance_km": float(google_route["distance_km"]),
+                    "duration_min": float(google_route["duration_min"]),
+                    "source": "google",
+                }
+
+        osrm_route = await self._osrm_route(
+            origin_lat,
+            origin_lng,
+            dest_lat,
+            dest_lng,
+            waypoints=stop_coords or None,
+        )
+        if not osrm_route:
+            return None
+        return {
+            "distance_km": float(osrm_route["distance_km"]),
+            "duration_min": float(osrm_route["duration_min"]),
+            "source": "osrm",
+        }
+
+    async def get_route_between(
+        self,
+        pickup: str,
+        dropoff: str,
+        waypoints: Optional[list[str]] = None,
+    ) -> Optional[dict]:
         origin = await self.resolve_address(pickup)
         destination = await self.resolve_address(dropoff)
         if not origin or not destination:
             return None
+
+        resolved_stops: list[dict] = []
+        for wp in (waypoints or [])[:3]:
+            stop = await self.resolve_address(wp)
+            if stop:
+                resolved_stops.append(stop)
+
+        stop_coords = [(s["lat"], s["lng"]) for s in resolved_stops]
 
         if self.api_key:
             google_route = await self._google_directions_route(
@@ -176,6 +229,7 @@ class MapsService:
                 origin["lng"],
                 destination["lat"],
                 destination["lng"],
+                waypoints=stop_coords or None,
             )
             if google_route:
                 return {
@@ -189,6 +243,14 @@ class MapsService:
                         "lng": destination["lng"],
                         "address": destination["formatted_address"],
                     },
+                    "stops": [
+                        {
+                            "lat": s["lat"],
+                            "lng": s["lng"],
+                            "address": s["formatted_address"],
+                        }
+                        for s in resolved_stops
+                    ],
                     "distance_km": google_route["distance_km"],
                     "duration_min": google_route["duration_min"],
                     "path": google_route["path"],
@@ -200,6 +262,7 @@ class MapsService:
             origin["lng"],
             destination["lat"],
             destination["lng"],
+            waypoints=stop_coords or None,
         )
         if not osrm_route:
             return None
@@ -215,6 +278,14 @@ class MapsService:
                 "lng": destination["lng"],
                 "address": destination["formatted_address"],
             },
+            "stops": [
+                {
+                    "lat": s["lat"],
+                    "lng": s["lng"],
+                    "address": s["formatted_address"],
+                }
+                for s in resolved_stops
+            ],
             "distance_km": osrm_route["distance_km"],
             "duration_min": osrm_route["duration_min"],
             "path": osrm_route["path"],
@@ -249,16 +320,22 @@ class MapsService:
         origin_lng: float,
         dest_lat: float,
         dest_lng: float,
+        waypoints: Optional[list[tuple[float, float]]] = None,
     ) -> Optional[dict]:
+        params: dict = {
+            "origin": f"{origin_lat},{origin_lng}",
+            "destination": f"{dest_lat},{dest_lng}",
+            "key": self.api_key,
+        }
+        if waypoints:
+            params["waypoints"] = "|".join(f"{lat},{lng}" for lat, lng in waypoints)
+            params["optimize"] = "false"
+
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(
                     f"{self.BASE_URL}/directions/json",
-                    params={
-                        "origin": f"{origin_lat},{origin_lng}",
-                        "destination": f"{dest_lat},{dest_lng}",
-                        "key": self.api_key,
-                    },
+                    params=params,
                 )
                 data = response.json()
         except httpx.HTTPError:
@@ -268,10 +345,15 @@ class MapsService:
             return None
 
         route = data["routes"][0]
-        leg = route["legs"][0]
+        legs = route.get("legs") or []
+        if not legs:
+            return None
+
+        distance_m = sum(leg.get("distance", {}).get("value", 0) for leg in legs)
+        duration_s = sum(leg.get("duration", {}).get("value", 0) for leg in legs)
         return {
-            "distance_km": leg["distance"]["value"] / 1000,
-            "duration_min": leg["duration"]["value"] / 60,
+            "distance_km": distance_m / 1000,
+            "duration_min": duration_s / 60,
             "path": self._decode_polyline(route["overview_polyline"]["points"]),
         }
 
@@ -281,10 +363,15 @@ class MapsService:
         origin_lng: float,
         dest_lat: float,
         dest_lng: float,
+        waypoints: Optional[list[tuple[float, float]]] = None,
     ) -> Optional[dict]:
+        coords = [f"{origin_lng},{origin_lat}"]
+        for lat, lng in waypoints or []:
+            coords.append(f"{lng},{lat}")
+        coords.append(f"{dest_lng},{dest_lat}")
         url = (
             "https://router.project-osrm.org/route/v1/driving/"
-            f"{origin_lng},{origin_lat};{dest_lng},{dest_lat}"
+            + ";".join(coords)
         )
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:

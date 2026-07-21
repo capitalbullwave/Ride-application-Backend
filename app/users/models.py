@@ -12,6 +12,7 @@ from app.core.database import Base, SoftDeleteMixin, TimestampMixin, UUIDMixin
 
 if TYPE_CHECKING:
     from app.auth.models import AuthDevice, UserSession
+    from app.corporate.models import CompanyEmployee
     from app.coupons.models import ReferralCode
     from app.notifications.models import Notification
     from app.ratings.models import Rating
@@ -55,6 +56,9 @@ class User(UUIDMixin, TimestampMixin, SoftDeleteMixin, Base):
     token_version: Mapped[int] = mapped_column(default=1, nullable=False)
 
     rides: Mapped[List["Ride"]] = relationship("Ride", back_populates="user", foreign_keys="Ride.user_id")
+    company_memberships: Mapped[List["CompanyEmployee"]] = relationship(
+        "CompanyEmployee", back_populates="user"
+    )
     wallet: Mapped[Optional["Wallet"]] = relationship("Wallet", back_populates="user", uselist=False)
     bank_accounts: Mapped[List["UserBankAccount"]] = relationship(
         "UserBankAccount", back_populates="user"

@@ -8,6 +8,13 @@ from pydantic import BaseModel, Field
 from app.schemas.common import BaseSchema
 
 
+class RideStopSchema(BaseModel):
+    address: str = Field(..., min_length=1, max_length=500)
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    sequence: int = Field(default=1, ge=1, le=3)
+
+
 class RideEstimateRequest(BaseModel):
     pickup_lat: float = Field(..., ge=-90, le=90, description="Pickup latitude")
     pickup_lng: float = Field(..., ge=-180, le=180, description="Pickup longitude")
@@ -25,6 +32,11 @@ class RideEstimateRequest(BaseModel):
         default=None,
         ge=0,
         description="Route duration from maps (minutes). Optional when distance_km is provided.",
+    )
+    stops: Optional[List[RideStopSchema]] = Field(
+        default=None,
+        max_length=3,
+        description="Optional intermediate stops. Fare uses full route pickup → stops → drop.",
     )
 
 
@@ -59,7 +71,7 @@ class RideBookRequest(BaseModel):
     dropoff_lat: float = Field(..., ge=-90, le=90)
     dropoff_lng: float = Field(..., ge=-180, le=180)
     vehicle_type_id: uuid.UUID
-    payment_method: str = Field(default="CASH", pattern="^(CASH|WALLET|UPI|CARD)$")
+    payment_method: str = Field(default="CASH", pattern="^(CASH|WALLET|UPI|CARD|COMPANY)$")
     promo_code: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     rental_hours: Optional[float] = Field(default=None, ge=0)
@@ -73,6 +85,15 @@ class RideBookRequest(BaseModel):
         ge=0,
         description="Route duration from maps (minutes). Optional when distance_km is provided.",
     )
+    stops: Optional[List[RideStopSchema]] = Field(
+        default=None,
+        max_length=3,
+        description="Optional intermediate stops between pickup and final dropoff (max 3).",
+    )
+    # Corporate booking (optional — personal rides omit these)
+    ride_type: str = Field(default="NORMAL", pattern="^(NORMAL|CORPORATE)$")
+    company_id: Optional[uuid.UUID] = None
+    employee_id: Optional[uuid.UUID] = None
 
 
 class RideCancelRequest(BaseModel):
@@ -109,6 +130,7 @@ class RideResponse(BaseSchema):
     dropoff_address: str
     dropoff_lat: float
     dropoff_lng: float
+    stops: Optional[List[RideStopSchema]] = None
     estimated_distance_km: float
     estimated_duration_min: float
     estimated_fare: float
@@ -117,6 +139,11 @@ class RideResponse(BaseSchema):
     driver_earning: Optional[float] = None
     company_earning: Optional[float] = None
     payment_method: str
+    ride_type: str = "NORMAL"
+    company_id: Optional[uuid.UUID] = None
+    employee_id: Optional[uuid.UUID] = None
+    payment_source: str = "USER"
+    company_name: Optional[str] = None
     created_at: datetime
     accepted_at: Optional[datetime] = None
     started_at: Optional[datetime] = None

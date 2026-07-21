@@ -8,7 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -287,6 +287,8 @@ async def _get_settings(db: AsyncSession) -> dict:
 
 
 async def _ride_with_names(db: AsyncSession, ride: Ride) -> dict:
+    from app.corporate.models import Company, CompanyEmployee
+
     user = await db.get(User, ride.user_id)
     driver = await db.get(Driver, ride.driver_id) if ride.driver_id else None
     mapped = _map_ride(ride, user, driver)
@@ -294,6 +296,17 @@ async def _ride_with_names(db: AsyncSession, ride: Ride) -> dict:
         vt = await db.get(VehicleType, ride.vehicle_type_id)
         if vt:
             mapped["vehicleType"] = vt.name.lower().replace(" ", "_")
+    if getattr(ride, "company_id", None):
+        company = await db.get(Company, ride.company_id)
+        if company:
+            mapped["companyName"] = company.company_name
+            mapped["companyCode"] = company.company_code
+    if getattr(ride, "employee_id", None):
+        employee = await db.get(CompanyEmployee, ride.employee_id)
+        if employee:
+            mapped["employeeCode"] = employee.employee_code
+            mapped["employeeDepartment"] = employee.department
+            mapped["employeeDesignation"] = employee.designation
     return mapped
 
 
@@ -545,7 +558,12 @@ async def online_drivers(
     drivers = result.scalars().all()
     items = []
     for d in drivers:
-        vehicle_result = await db.execute(select(Vehicle).where(Vehicle.driver_id == d.id).limit(1))
+        vehicle_result = await db.execute(
+            select(Vehicle)
+            .options(selectinload(Vehicle.vehicle_type))
+            .where(Vehicle.driver_id == d.id, Vehicle.is_deleted == False)
+            .limit(1)
+        )
         vehicle = vehicle_result.scalar_one_or_none()
         mapped = _map_driver(d, vehicle)
         items.append({"id": mapped["id"], "name": mapped["name"], "vehicleType": mapped["vehicleType"], "status": mapped["status"]})
@@ -601,8 +619,34 @@ async def list_rides(
 
 
 @router.get("/rides/export")
-async def export_rides(admin: Annotated[AdminUser, Depends(get_current_admin)], db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Ride).order_by(Ride.created_at.desc()).limit(5000))
+async def export_rides(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    status: str | None = None,
+    search: str | None = None,
+):
+    """Must stay above `/rides/{ride_id}` so `export` is not parsed as a UUID."""
+    query = select(Ride)
+    if status and status != "all":
+        status_map = {
+            "requested": [RideStatus.REQUESTED.value, RideStatus.SEARCHING.value],
+            "driver_assigned": [RideStatus.ACCEPTED.value],
+            "driver_arrived": [RideStatus.DRIVER_ARRIVED.value],
+            "ride_started": [RideStatus.STARTED.value],
+            "ride_completed": [RideStatus.COMPLETED.value],
+            "cancelled": [RideStatus.CANCELLED.value],
+        }
+        if status in status_map:
+            query = query.where(Ride.status.in_(status_map[status]))
+    if search:
+        term = f"%{search}%"
+        query = query.where(
+            or_(
+                Ride.pickup_address.ilike(term),
+                Ride.dropoff_address.ilike(term),
+            )
+        )
+    result = await db.execute(query.order_by(Ride.created_at.desc()).limit(5000))
     rides = result.scalars().all()
     output = io.StringIO()
     writer = csv.writer(output)
@@ -617,8 +661,8 @@ async def export_rides(admin: Annotated[AdminUser, Depends(get_current_admin)], 
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=rides.csv"},
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=wavego-rides.csv"},
     )
 
 
@@ -647,32 +691,6 @@ async def list_ride_messages_admin(
         raise NotFoundException("Ride not found")
     service = RideChatService(db)
     return {"success": True, "data": await service.list_messages(ride_id)}
-
-
-@router.get("/users/export")
-async def export_users(admin: Annotated[AdminUser, Depends(get_current_admin)], db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.is_deleted == False).order_by(User.created_at.desc()))
-    users = result.scalars().all()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["ID", "Name", "Email", "Phone", "Status", "Registered"])
-    for u in users:
-        writer.writerow([str(u.id), f"{u.first_name} {u.last_name}", u.email, u.phone, "active" if u.is_active else "blocked", u.created_at.date()])
-    output.seek(0)
-    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=users.csv"})
-
-
-@router.get("/drivers/export")
-async def export_drivers(admin: Annotated[AdminUser, Depends(get_current_admin)], db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Driver).where(Driver.is_deleted == False).order_by(Driver.created_at.desc()))
-    drivers = result.scalars().all()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["ID", "Name", "Email", "Phone", "Status", "KYC", "Joined"])
-    for d in drivers:
-        writer.writerow([str(d.id), f"{d.first_name} {d.last_name}", d.email, d.phone, d.status, d.kyc_status, d.created_at.date()])
-    output.seek(0)
-    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=drivers.csv"})
 
 
 @router.get("/finance/transactions")
@@ -1893,3 +1911,236 @@ async def admin_list_subscription_subscribers(
         "page_size": page_size,
         "total": total,
     }
+
+
+# ── Driver selfie verification & shifts ───────────────────────────────
+
+
+class ForceOfflineBody(BaseModel):
+    reason: str = Field(default="Forced offline by admin", max_length=255)
+
+
+def _map_selfie_log(log) -> dict:
+    return {
+        "id": str(log.id),
+        "driverId": str(log.driver_id),
+        "shiftId": str(log.shift_id) if log.shift_id else None,
+        "status": log.status,
+        "matched": log.matched,
+        "confidenceScore": log.confidence_score,
+        "livenessPassed": log.liveness_passed,
+        "livenessDetails": log.liveness_details,
+        "faceProvider": log.face_provider,
+        "livenessProvider": log.liveness_provider,
+        "selfieImagePath": log.selfie_image_path,
+        "errorCode": log.error_code,
+        "errorMessage": log.error_message,
+        "attemptNumber": log.attempt_number,
+        "source": log.source,
+        "createdAt": log.created_at.isoformat() if log.created_at else None,
+    }
+
+
+def _map_shift(shift) -> dict:
+    return {
+        "id": str(shift.id),
+        "driverId": str(shift.driver_id),
+        "startedAt": shift.started_at.isoformat() if shift.started_at else None,
+        "endedAt": shift.ended_at.isoformat() if shift.ended_at else None,
+        "status": shift.status,
+        "selfieVerified": shift.selfie_verified,
+        "selfieVerifiedAt": shift.selfie_verified_at.isoformat() if shift.selfie_verified_at else None,
+        "forceCloseReason": shift.force_close_reason,
+        "verificationLogId": str(shift.verification_log_id) if shift.verification_log_id else None,
+    }
+
+
+@router.get("/selfie-verifications")
+async def list_selfie_verifications(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    driver_id: UUID | None = None,
+    status: str | None = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+):
+    from app.selfie_verification.models import DriverSelfieLog
+
+    query = select(DriverSelfieLog).order_by(DriverSelfieLog.created_at.desc())
+    count_q = select(func.count()).select_from(DriverSelfieLog)
+    if driver_id:
+        query = query.where(DriverSelfieLog.driver_id == driver_id)
+        count_q = count_q.where(DriverSelfieLog.driver_id == driver_id)
+    if status and status != "all":
+        query = query.where(DriverSelfieLog.status == status)
+        count_q = count_q.where(DriverSelfieLog.status == status)
+
+    total = int(await db.scalar(count_q) or 0)
+    result = await db.execute(query.offset((page - 1) * limit).limit(limit))
+    logs = result.scalars().all()
+
+    driver_ids = {log.driver_id for log in logs}
+    drivers = {}
+    if driver_ids:
+        dres = await db.execute(select(Driver).where(Driver.id.in_(driver_ids)))
+        drivers = {d.id: d for d in dres.scalars().all()}
+
+    items = []
+    for log in logs:
+        mapped = _map_selfie_log(log)
+        driver = drivers.get(log.driver_id)
+        if driver:
+            mapped["driverName"] = f"{driver.first_name} {driver.last_name}".strip()
+            mapped["driverPhone"] = driver.phone
+        items.append(mapped)
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": max(1, (total + limit - 1) // limit),
+    }
+
+
+@router.get("/selfie-verifications/{log_id}")
+async def get_selfie_verification(
+    log_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.selfie_verification.models import DriverSelfieLog
+    from app.selfie_verification.storage import load_selfie_bytes
+    import base64
+
+    result = await db.execute(select(DriverSelfieLog).where(DriverSelfieLog.id == log_id))
+    log = result.scalar_one_or_none()
+    if not log:
+        raise NotFoundException("Verification log not found")
+
+    mapped = _map_selfie_log(log)
+    driver = await db.get(Driver, log.driver_id)
+    if driver:
+        mapped["driverName"] = f"{driver.first_name} {driver.last_name}".strip()
+        mapped["driverPhone"] = driver.phone
+
+    # Admin-only decrypted preview (data URL). Never expose via driver APIs.
+    if log.selfie_image_path:
+        raw = load_selfie_bytes(log.selfie_image_path)
+        if raw:
+            mapped["selfieImageDataUrl"] = (
+                f"data:image/jpeg;base64,{base64.b64encode(raw).decode('ascii')}"
+            )
+    return mapped
+
+
+@router.delete("/selfie-verifications/{log_id}")
+async def delete_selfie_verification(
+    log_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.selfie_verification.models import DriverSelfieLog, DriverShift
+    from app.selfie_verification.storage import delete_selfie_file
+
+    result = await db.execute(select(DriverSelfieLog).where(DriverSelfieLog.id == log_id))
+    log = result.scalar_one_or_none()
+    if not log:
+        raise NotFoundException("Verification log not found")
+
+    # Detach any shifts that reference this log (no FK constraint, but keep data clean).
+    await db.execute(
+        update(DriverShift)
+        .where(DriverShift.verification_log_id == log_id)
+        .values(verification_log_id=None)
+    )
+
+    delete_selfie_file(log.selfie_image_path)
+    await db.delete(log)
+    await db.flush()
+    return {"ok": True, "id": str(log_id)}
+
+
+@router.get("/drivers/{driver_id}/shifts")
+async def list_driver_shifts(
+    driver_id: UUID,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+):
+    from app.selfie_verification.models import DriverShift
+
+    driver = await db.get(Driver, driver_id)
+    if not driver or driver.is_deleted:
+        raise NotFoundException("Driver not found")
+
+    count_q = select(func.count()).select_from(DriverShift).where(DriverShift.driver_id == driver_id)
+    total = int(await db.scalar(count_q) or 0)
+    result = await db.execute(
+        select(DriverShift)
+        .where(DriverShift.driver_id == driver_id)
+        .order_by(DriverShift.started_at.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
+    return {
+        "items": [_map_shift(s) for s in result.scalars().all()],
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.get("/online-drivers/verified")
+async def list_online_verified_drivers(
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+):
+    from app.core.constants import ShiftStatus
+    from app.selfie_verification.models import DriverShift
+
+    result = await db.execute(
+        select(Driver, DriverShift)
+        .join(
+            DriverShift,
+            and_(
+                DriverShift.driver_id == Driver.id,
+                DriverShift.status == ShiftStatus.ACTIVE.value,
+                DriverShift.selfie_verified.is_(True),
+            ),
+        )
+        .where(
+            Driver.is_deleted.is_(False),
+            Driver.status.in_([DriverStatus.ONLINE.value, DriverStatus.ON_RIDE.value]),
+        )
+        .limit(limit)
+    )
+    items = []
+    for driver, shift in result.all():
+        items.append(
+            {
+                "id": str(driver.id),
+                "name": f"{driver.first_name} {driver.last_name}".strip(),
+                "phone": driver.phone,
+                "status": driver.status,
+                "shift": _map_shift(shift),
+            }
+        )
+    return {"items": items}
+
+
+@router.post("/drivers/{driver_id}/force-offline")
+async def force_offline_driver(
+    driver_id: UUID,
+    body: ForceOfflineBody,
+    admin: Annotated[AdminUser, Depends(get_current_admin)],
+    db: AsyncSession = Depends(get_db),
+):
+    from app.selfie_verification.service import DriverSelfieShiftService
+
+    driver = await db.get(Driver, driver_id)
+    if not driver or driver.is_deleted:
+        raise NotFoundException("Driver not found")
+    return await DriverSelfieShiftService(db).admin_force_offline(driver, body.reason)

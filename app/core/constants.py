@@ -6,6 +6,7 @@ class UserRole(str, Enum):
     DRIVER = "DRIVER"
     ADMIN = "ADMIN"
     SUPER_ADMIN = "SUPER_ADMIN"
+    COMPANY = "COMPANY"
 
 
 class RideStatus(str, Enum):
@@ -48,10 +49,34 @@ class PaymentMethod(str, Enum):
     WALLET = "WALLET"
     UPI = "UPI"
     CARD = "CARD"
+    COMPANY = "COMPANY"
     STRIPE = "STRIPE"
     RAZORPAY = "RAZORPAY"
     CASHFREE = "CASHFREE"
     PHONEPE = "PHONEPE"
+
+
+class RideType(str, Enum):
+    NORMAL = "NORMAL"
+    CORPORATE = "CORPORATE"
+
+
+class PaymentSource(str, Enum):
+    USER = "USER"
+    COMPANY = "COMPANY"
+
+
+class CompanyStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    SUSPENDED = "SUSPENDED"
+
+
+class CompanyEmployeeStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    REMOVED = "REMOVED"
 
 
 class PaymentStatus(str, Enum):
@@ -169,3 +194,33 @@ class DevicePlatform(str, Enum):
 class RaterType(str, Enum):
     USER = "USER"
     DRIVER = "DRIVER"
+
+
+class ShiftStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FORCE_CLOSED = "force_closed"
+
+
+class SelfieVerificationStatus(str, Enum):
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+    RATE_LIMITED = "rate_limited"
+
+
+class FaceProvider(str, Enum):
+    MOCK = "mock"
+    AWS_REKOGNITION = "aws_rekognition"
+    AZURE_FACE = "azure_face"
+    FACEPP = "facepp"
+    INSIGHTFACE = "insightface"
+    DEEPFACE = "deepface"
+
+
+class LivenessProvider(str, Enum):
+    MOCK = "mock"
+    CLIENT_CHALLENGE = "client_challenge"
+    INSTANT_CAPTURE = "instant_capture"
+    AWS_REKOGNITION = "aws_rekognition"
+    AZURE_FACE = "azure_face"

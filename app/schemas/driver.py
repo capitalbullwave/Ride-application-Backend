@@ -103,9 +103,30 @@ class DriverPhoneOTPVerify(BaseModel):
 class DriverUpdate(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
+    email: Optional[str] = None
     profile_photo: Optional[str] = None
     license_number: Optional[str] = None
     fcm_token: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        email = v.strip().lower()
+        if not email:
+            return ""
+        # Basic shape check — empty string means "clear to placeholder".
+        if "@" not in email or "." not in email.split("@")[-1]:
+            raise ValueError("Enter a valid email address")
+        return email
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def strip_names(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v.strip()
 
 
 class DriverDocumentCreate(BaseModel):

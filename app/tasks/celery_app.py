@@ -82,3 +82,28 @@ def process_ride_matching(ride_id: str):
 @celery_app.task(name="generate_invoice")
 def generate_invoice(payment_id: str):
     return {"payment_id": payment_id, "invoice_url": f"/invoices/{payment_id}.pdf"}
+
+
+@celery_app.task(name="force_close_stale_driver_shifts")
+def force_close_stale_driver_shifts():
+    """Close active shifts older than 16h or from a previous calendar day."""
+    import asyncio
+
+    from app.core.database import AsyncSessionLocal
+    from app.selfie_verification.service import DriverSelfieShiftService
+
+    async def _run() -> int:
+        async with AsyncSessionLocal() as session:
+            return await DriverSelfieShiftService(session).force_close_all_stale_shifts()
+
+    closed = asyncio.run(_run())
+    return {"closed": closed}
+
+
+celery_app.conf.beat_schedule = {
+    **getattr(celery_app.conf, "beat_schedule", None) or {},
+    "force-close-stale-driver-shifts": {
+        "task": "force_close_stale_driver_shifts",
+        "schedule": 300.0,  # every 5 minutes
+    },
+}

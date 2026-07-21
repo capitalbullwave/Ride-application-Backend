@@ -6,7 +6,9 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -46,6 +48,7 @@ ALLOWED_PREFIXES = (
     f"{settings.api_v1_prefix}/drivers",
     f"{settings.api_v1_prefix}/notifications",
     f"{settings.api_v1_prefix}/admin",
+    f"{settings.api_v1_prefix}/corporate",
     f"{settings.api_v1_prefix}/common",
     f"{settings.api_v1_prefix}/public",
     "/ws",
@@ -62,7 +65,52 @@ async def lifespan(app: FastAPI):
         initialize_firebase()
     except Exception as exc:
         logger.warning("firebase_startup_skipped", error=str(exc))
+
+    # Warm InsightFace model once so first selfie verify is not cold-start slow.
+    if (settings.face_provider or "").lower().strip() == "insightface":
+        try:
+            import asyncio
+
+            from app.selfie_verification.face.insightface import get_face_analysis
+
+            await asyncio.to_thread(get_face_analysis)
+            logger.info("insightface_warmup_ok")
+        except Exception as exc:
+            logger.warning("insightface_warmup_skipped", error=str(exc))
+
+    # Auto force-close stale shifts + offline drivers (works even without Celery).
+    import asyncio
+
+    stale_shift_task: asyncio.Task | None = None
+
+    async def _stale_shift_loop() -> None:
+        from app.core.database import AsyncSessionLocal
+        from app.selfie_verification.service import DriverSelfieShiftService
+
+        while True:
+            try:
+                async with AsyncSessionLocal() as session:
+                    closed = await DriverSelfieShiftService(session).force_close_all_stale_shifts()
+                    if closed:
+                        logger.info("stale_shifts_auto_closed", closed=closed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("stale_shift_loop_error", error=str(exc))
+            await asyncio.sleep(300)  # every 5 minutes
+
+    stale_shift_task = asyncio.create_task(_stale_shift_loop())
+    logger.info("stale_shift_auto_close_started", interval_sec=300)
+
     yield
+
+    if stale_shift_task is not None:
+        stale_shift_task.cancel()
+        try:
+            await stale_shift_task
+        except asyncio.CancelledError:
+            pass
+
     await close_redis()
     logger.info("application_stopped")
 
@@ -106,6 +154,7 @@ def create_app() -> FastAPI:
 
     @application.get("/health", include_in_schema=False, tags=["Health"])
     async def health_check():
+        """Liveness for Render/load balancers — keep this fast (no DB)."""
         return {
             "status": "healthy",
             "app": settings.app_name,
@@ -121,6 +170,22 @@ def create_app() -> FastAPI:
                 "websocket": "/ws",
             },
         }
+
+    @application.get("/health/ready", include_in_schema=False, tags=["Health"])
+    async def readiness_check():
+        """Readiness — verifies DB connectivity for deeper monitoring."""
+        from app.core.database import async_engine
+
+        try:
+            async with async_engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return {"status": "ready", "database": "ok"}
+        except Exception as exc:
+            logger.warning("readiness_check_failed", error=str(exc))
+            return JSONResponse(
+                status_code=503,
+                content={"status": "not_ready", "database": "error"},
+            )
 
     @application.websocket("/ws/{token}")
     async def websocket_legacy(websocket: WebSocket, token: str):

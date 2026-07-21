@@ -26,7 +26,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time-Ms"] = str(duration_ms)
 
-        if request.url.path not in ("/health", "/docs", "/openapi.json", "/redoc"):
+        if request.url.path not in ("/health", "/health/ready", "/docs", "/openapi.json", "/redoc"):
             logger.info("request_completed", status_code=response.status_code, duration_ms=duration_ms)
 
         return response

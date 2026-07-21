@@ -7,10 +7,18 @@ from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.constants import ActorType, PaymentMethod, RideEventType, RideStatus
+from app.core.constants import (
+    ActorType,
+    PaymentMethod,
+    PaymentSource,
+    RideEventType,
+    RideStatus,
+    RideType,
+)
 from app.core.database import Base, TimestampMixin, UUIDMixin
 
 if TYPE_CHECKING:
+    from app.corporate.models import Company, CompanyEmployee
     from app.coupons.models import PromoCode
     from app.drivers.models import Driver
     from app.payments.models import Payment
@@ -47,6 +55,9 @@ class Ride(UUIDMixin, TimestampMixin, Base):
     dropoff_address: Mapped[str] = mapped_column(String(500), nullable=False)
     dropoff_lat: Mapped[float] = mapped_column(Float, nullable=False)
     dropoff_lng: Mapped[float] = mapped_column(Float, nullable=False)
+    # Ordered intermediate stops between pickup and final dropoff (max 3).
+    # Shape: [{"address": str, "lat": float, "lng": float, "sequence": int}, ...]
+    stops: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
     estimated_distance_km: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     estimated_duration_min: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     actual_distance_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -80,12 +91,36 @@ class Ride(UUIDMixin, TimestampMixin, Base):
     cancelled_by: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     cancellation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     route_polyline: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Female passengers: prefer women captains first; expand only after user confirms.
+    prefer_women_riders: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    allow_all_riders: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Women Safety Ride mode (SOS / share / safety check UI).
+    women_safety_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_emergency: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Corporate ride fields (NORMAL by default — personal booking unchanged)
+    ride_type: Mapped[str] = mapped_column(
+        String(20), default=RideType.NORMAL.value, nullable=False, index=True
+    )
+    company_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    employee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("company_employees.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    payment_source: Mapped[str] = mapped_column(
+        String(20), default=PaymentSource.USER.value, nullable=False
+    )
 
     user: Mapped["User"] = relationship("User", back_populates="rides", foreign_keys=[user_id])
     driver: Mapped[Optional["Driver"]] = relationship("Driver", back_populates="rides", foreign_keys=[driver_id])
     vehicle: Mapped[Optional["Vehicle"]] = relationship("Vehicle", back_populates="rides")
     vehicle_type: Mapped["VehicleType"] = relationship("VehicleType", back_populates="rides")
     promo_code: Mapped[Optional["PromoCode"]] = relationship("PromoCode", back_populates="rides")
+    company: Mapped[Optional["Company"]] = relationship("Company", back_populates="rides")
+    employee: Mapped[Optional["CompanyEmployee"]] = relationship("CompanyEmployee", back_populates="rides")
     tracking: Mapped[List["RideTracking"]] = relationship("RideTracking", back_populates="ride")
     events: Mapped[List["RideEvent"]] = relationship("RideEvent", back_populates="ride", order_by="RideEvent.created_at")
     payment: Mapped[Optional["Payment"]] = relationship("Payment", back_populates="ride", uselist=False)

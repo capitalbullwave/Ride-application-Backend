@@ -356,6 +356,8 @@ class NotificationService:
             "driver_id": str(driver.id),
             "driver_name": driver_name,
             "driver_phone": phone,
+            "driver_rating": float(getattr(driver, "rating_avg", 0) or 0),
+            "driver_photo_url": getattr(driver, "profile_photo", None),
             "vehicle_number": vehicle_number,
             "start_code": start_code,
             "pickup_address": ride.pickup_address,

@@ -31,7 +31,9 @@ class RideRepository(BaseRepository[Ride]):
     async def get_user_rides(
         self, user_id: uuid.UUID, page: int = 1, page_size: int = 20, status: Optional[str] = None
     ) -> List[Ride]:
-        query = select(Ride).where(Ride.user_id == user_id)
+        from sqlalchemy.orm import selectinload
+
+        query = select(Ride).options(selectinload(Ride.company)).where(Ride.user_id == user_id)
         if status:
             query = query.where(Ride.status == status)
         query = query.order_by(Ride.created_at.desc())

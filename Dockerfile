@@ -12,4 +12,6 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Single worker keeps Render free/starter memory under control.
+# Keep-alive helps proxies; cold-start 503s are mitigated by keep-alive cron + client retries.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "5", "--proxy-headers"]
